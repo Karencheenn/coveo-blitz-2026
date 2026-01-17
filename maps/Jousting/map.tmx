@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<map version="1.10" tiledversion="1.11.2" orientation="orthogonal" renderorder="right-down" width="9" height="9" tilewidth="1" tileheight="1" infinite="0" nextlayerid="10" nextobjectid="1">
+ <tileset firstgid="1" name="teams" tilewidth="1" tileheight="1" tilecount="5" columns="5">
+  <image source="../teams.png" width="5" height="1"/>
+ </tileset>
+ <tileset firstgid="6" name="nutrients" tilewidth="1" tileheight="1" tilecount="100" columns="10">
+  <image source="../nutrients.png" width="10" height="10"/>
+ </tileset>
+ <layer id="8" name="Biomass" width="9" height="9">
+  <data encoding="csv">
+15,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,15
+</data>
+ </layer>
+ <layer id="9" name="Nutrients" width="9" height="9">
+  <data encoding="csv">
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,15,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0
+</data>
+ </layer>
+ <layer id="1" name="Colony" width="9" height="9" opacity="0.77">
+  <data encoding="csv">
+1,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,2
+</data>
+ </layer>
+ <objectgroup id="2" name="Meta">
+  <properties>
+   <property name="difficulty" value="hard"/>
+   <property name="name" value="Jousting"/>
+   <property name="playerCount" value="2"/>
+  </properties>
+ </objectgroup>
+</map>

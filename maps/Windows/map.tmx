@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<map version="1.10" tiledversion="1.11.2" orientation="orthogonal" renderorder="right-down" width="12" height="12" tilewidth="1" tileheight="1" infinite="0" nextlayerid="10" nextobjectid="1">
+ <tileset firstgid="1" name="teams" tilewidth="1" tileheight="1" tilecount="5" columns="5">
+  <image source="../teams.png" width="5" height="1"/>
+ </tileset>
+ <tileset firstgid="6" name="nutrients" tilewidth="1" tileheight="1" tilecount="100" columns="10">
+  <image source="../nutrients.png" width="10" height="10"/>
+ </tileset>
+ <layer id="8" name="Biomass" width="12" height="12">
+  <data encoding="csv">
+8,8,8,8,8,8,8,8,8,8,8,8,
+8,8,8,8,8,8,8,8,8,8,8,8,
+8,8,8,8,8,8,8,8,8,8,8,8,
+8,8,8,8,8,8,8,8,8,8,8,8,
+8,8,8,8,8,8,8,8,8,8,8,8,
+8,8,8,8,8,8,8,8,8,8,8,8,
+8,8,8,8,8,8,8,8,8,8,8,8,
+8,8,8,8,8,8,8,8,8,8,8,8,
+8,8,8,8,8,8,8,8,8,8,8,8,
+8,8,8,8,8,8,8,8,8,8,8,8,
+8,8,8,8,8,8,8,8,8,8,8,8,
+8,8,8,8,8,8,8,8,8,8,8,8
+</data>
+ </layer>
+ <layer id="9" name="Nutrients" width="12" height="12">
+  <data encoding="csv">
+0,0,0,0,0,0,0,0,0,0,0,0,
+0,15,15,0,0,0,0,0,0,15,15,0,
+0,15,15,0,0,0,0,0,0,15,15,0,
+0,0,0,0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,25,25,0,0,0,0,0,
+0,0,0,0,0,25,25,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,0,0,0,
+0,0,0,0,0,0,0,0,0,0,0,0,
+0,15,15,0,0,0,0,0,0,15,15,0,
+0,15,15,0,0,0,0,0,0,15,15,0,
+0,0,0,0,0,0,0,0,0,0,0,0
+</data>
+ </layer>
+ <layer id="1" name="Colony" width="12" height="12" opacity="0.77">
+  <data encoding="csv">
+2,2,2,2,2,2,3,3,3,3,3,3,
+2,2,2,2,2,2,3,3,3,3,3,3,
+2,2,2,2,2,2,3,3,3,3,3,3,
+2,2,2,2,2,2,3,3,3,3,3,3,
+2,2,2,2,2,2,3,3,3,3,3,3,
+2,2,2,2,2,2,3,3,3,3,3,3,
+4,4,4,4,4,4,1,1,1,1,1,1,
+4,4,4,4,4,4,1,1,1,1,1,1,
+4,4,4,4,4,4,1,1,1,1,1,1,
+4,4,4,4,4,4,1,1,1,1,1,1,
+4,4,4,4,4,4,1,1,1,1,1,1,
+4,4,4,4,4,4,1,1,1,1,1,1
+</data>
+ </layer>
+ <objectgroup id="2" name="Meta">
+  <properties>
+   <property name="difficulty" value="easy"/>
+   <property name="name" value="Windows"/>
+   <property name="playerCount" value="4"/>
+  </properties>
+ </objectgroup>
+</map>
