@@ -50,15 +50,10 @@ _GLOBAL_TOP_TILES_CACHE: Dict[Tuple[int, int], List[Point]] = {}
 
 
 # ============================================================================
-# 🗺️ IMPROVED MAP ANALYSIS CLASS
+# 🗺️ MAP ANALYSIS CLASS
 # ============================================================================
 class ImprovedMapAnalysis:
-    """
-    改进的地图分析系统
-    - 智能识别地图类型（open_rush, blocked_small, medium, large）
-    - 动态调整建造时机
-    - 自适应 2-biomass 惩罚
-    """
+    """地图分析系统"""
     
     def __init__(self):
         self._map_type_cache: Dict[Tuple[int, int], str] = {}
@@ -71,44 +66,32 @@ class ImprovedMapAnalysis:
         my_spore_count: int,
         nutrient_grid: List[List[int]]
     ) -> str:
-        """
-        识别地图类型：
-        - "open_rush": 开阔小图，适合快速建造
-        - "blocked_small": 有障碍的小图（Cross等），需要先清理
-        - "medium": 中型图
-        - "large": 大型图
-        """
+        """识别地图类型"""
         key = (width, height)
         if key in self._map_type_cache:
             return self._map_type_cache[key]
         
         area = width * height
-        
-        # 计算中心区域的 neutral 密度
         center_x, center_y = width // 2, height // 2
         center_neutrals = sum(
             1 for pt, _ in neutral_spores
             if abs(pt.x - center_x) <= 3 and abs(pt.y - center_y) <= 3
         )
-        
-        # 计算总 neutral 数量
         total_neutrals = len(neutral_spores)
         
-        # 分类逻辑
-        if area <= 225:  # 小图 (15x15 或更小)
-            # Cross 类型检测：中心有密集 neutral
+        if area <= 225:
             if center_neutrals >= 5 or total_neutrals >= 8:
                 map_type = "blocked_small"
-                print(f"🗺️  Map Type: BLOCKED_SMALL (neutrals: {total_neutrals}, center: {center_neutrals})")
+                print(f"🗺️  Map: BLOCKED_SMALL (neutrals: {total_neutrals}, center: {center_neutrals})")
             else:
                 map_type = "open_rush"
-                print(f"🗺️  Map Type: OPEN_RUSH (area: {area})")
-        elif area <= 900:  # 中型图 (30x30 或更小)
+                print(f"🗺️  Map: OPEN_RUSH (area: {area})")
+        elif area <= 900:
             map_type = "medium"
-            print(f"🗺️  Map Type: MEDIUM (area: {area})")
+            print(f"🗺️  Map: MEDIUM (area: {area})")
         else:
             map_type = "large"
-            print(f"🗺️  Map Type: LARGE (area: {area})")
+            print(f"🗺️  Map: LARGE (area: {area})")
         
         self._map_type_cache[key] = map_type
         return map_type
@@ -124,43 +107,25 @@ class ImprovedMapAnalysis:
         neutral_count: int,
         my_nutrients: int
     ) -> Tuple[bool, int, bool]:
-        """
-        返回: (should_build, min_biomass_needed, is_emergency)
-        
-        改进点：
-        1. blocked_small 地图延迟建造
-        2. 确保有足够单位存活
-        3. Emergency 模式更宽松
-        """
-        
-        # 🚨 Emergency 条件
+        """返回: (should_build, min_biomass_needed, is_emergency)"""
         is_emergency = tick >= 20
         
         if map_type == "open_rush":
-            # 真正的小图 rush
             if tick >= 2 and actionable_count >= 1 and max_biomass >= next_spawner_cost:
                 return (True, next_spawner_cost + 1, False)
         
         elif map_type == "blocked_small":
-            # Cross 等有障碍的小图 - 关键改进！
-            
-            # ⚠️ 核心逻辑：如果有很多 neutral，必须等待
             if neutral_count >= 5:
-                # 策略1：等到有多个单位再建造
                 if tick >= 15 and actionable_count >= 2 and max_biomass >= next_spawner_cost + 2:
                     return (True, max(next_spawner_cost + 2, 4), False)
-                # 策略2：Emergency 模式但要求更高
                 elif tick >= 25 and actionable_count >= 1 and max_biomass >= 3:
                     return (True, max(next_spawner_cost, 3), True)
-                # 否则继续等待
                 return (False, 0, False)
             else:
-                # neutral 已清理大部分，可以建造
                 if tick >= 5 and actionable_count >= 1 and max_biomass >= next_spawner_cost + 1:
                     return (True, next_spawner_cost + 1, False)
         
         elif map_type == "medium":
-            # 中型图
             if total_spore_count <= 6:
                 if actionable_count >= 2 or tick > 15:
                     return (True, max(next_spawner_cost + 1, 4), False)
@@ -172,78 +137,176 @@ class ImprovedMapAnalysis:
             if actionable_count >= 4 or tick > 25:
                 return (True, max(next_spawner_cost + 2, 6), False)
         
-        # Emergency fallback - 但要确保不会自杀
         if is_emergency and actionable_count >= 1:
-            # 确保建造后还有 actionable spores
             if max_biomass >= next_spawner_cost + 2:
                 return (True, max(3, next_spawner_cost), True)
         
         return (False, 0, False)
+
+
+# ============================================================================
+# 🌍 EXPANSION ENHANCEMENT CLASS
+# ============================================================================
+class ExpansionEnhancement:
+    """扩张增强系统 - 解决 nutrient generation 停滞问题"""
     
-    def calculate_2biomass_penalty(
+    def __init__(self):
+        self._last_territory_count: int = 0
+        self._stagnation_ticks: int = 0
+    
+    def detect_expansion_stagnation(
+        self,
+        current_territory: int,
+        tick: int,
+        check_interval: int = 20
+    ) -> bool:
+        """检测扩张是否停滞"""
+        if tick % check_interval == 0:
+            if current_territory <= self._last_territory_count + 2:
+                self._stagnation_ticks += check_interval
+            else:
+                self._stagnation_ticks = 0
+            self._last_territory_count = current_territory
+        
+        return self._stagnation_ticks >= 40
+    
+    def calculate_expansion_bonus(
+        self,
+        pt: Point,
+        my_center: Point,
+        my_territory_count: int,
+        total_tiles: int,
+        is_stagnant: bool
+    ) -> int:
+        """计算扩张加分"""
+        dist_from_center = _manhattan(pt, my_center)
+        control_rate = my_territory_count / total_tiles if total_tiles > 0 else 0
+        
+        bonus = 0
+        
+        if control_rate < 0.3:
+            bonus += dist_from_center * 8
+        elif control_rate < 0.5:
+            bonus += dist_from_center * 4
+        
+        if is_stagnant:
+            bonus += 150
+        
+        return bonus
+    
+    def improved_2biomass_penalty(
         self,
         map_type: str,
         tick: int,
         my_tile_count: int,
         total_tiles: int,
-        spawner_count: int
+        spawner_count: int,
+        is_stagnant: bool,
+        nutrient_generation: int
     ) -> int:
-        """
-        动态调整 2-biomass 移动惩罚
-        
-        原则：
-        - 早期需要扩张 -> 低惩罚
-        - 控制率低 -> 低惩罚  
-        - 后期 + 有 spawner -> 高惩罚（保护单位）
-        """
+        """改进的 2-biomass 惩罚"""
         control_rate = my_tile_count / total_tiles if total_tiles > 0 else 0
         
-        # 早期阶段：必须扩张
-        if tick < 50:
-            if map_type == "blocked_small":
-                # Cross 等地图早期更需要移动清理 neutral
-                return 150
-            elif map_type == "open_rush":
-                return 200
-            return 300
+        if is_stagnant:
+            return 50
         
-        # 中期：根据控制率调整
-        if tick < 200:
-            if control_rate < 0.15:
-                return 250  # 控制率太低，必须扩张
-            elif control_rate < 0.30:
-                return 400
+        if tick < 100:
+            if nutrient_generation < 10:
+                return 80
+            elif map_type == "blocked_small":
+                return 120
             else:
-                return 600
+                return 150
         
-        # 后期：保护模式
-        if tick >= 500:
-            if spawner_count >= 2:
-                return 900  # 有经济了，保护单位
-            return 700
+        if tick < 300:
+            if nutrient_generation < 20:
+                return 150
+            elif control_rate < 0.25:
+                return 200
+            else:
+                return 350
         
-        # 默认中等惩罚
-        return 500
+        if tick < 600:
+            if control_rate < 0.4:
+                return 300
+            else:
+                return 500
+        
+        if spawner_count >= 2:
+            return 800
+        return 600
+    
+    def aggressive_spawner_production(
+        self,
+        tick: int,
+        local_threat: int,
+        spore_count: int,
+        nutrients: int,
+        my_territory_count: int,
+        total_tiles: int,
+        is_stagnant: bool,
+        nutrient_generation: int
+    ) -> int:
+        """激进的 Spawner 生产策略"""
+        control_rate = my_territory_count / total_tiles if total_tiles > 0 else 0
+        
+        if is_stagnant and nutrients >= 30:
+            return min(nutrients // 3, 15)
+        
+        if tick < 150:
+            if spore_count < 10:
+                return max(8, nutrients // 6)
+            elif spore_count < 20:
+                return max(6, nutrients // 8)
+            else:
+                return max(4, nutrients // 10)
+        
+        if tick < 400:
+            if nutrient_generation < 15:
+                return max(5, nutrients // 10)
+            elif nutrient_generation < 30:
+                return max(6, nutrients // 8)
+            else:
+                return max(7, nutrients // 7)
+        
+        if tick < 700:
+            if local_threat > 0:
+                return max(local_threat + 3, 8)
+            
+            if control_rate < 0.4:
+                return max(8, nutrients // 6)
+            else:
+                return max(6, nutrients // 8)
+        
+        if nutrients >= 2000:
+            return min(15, nutrients // 5)
+        elif nutrients >= 1000:
+            return min(12, nutrients // 6)
+        elif local_threat > 0:
+            return max(local_threat + 3, 8)
+        else:
+            return max(7, nutrients // 8)
 
 
 # ============================================================================
 # 🤖 MAIN BOT CLASS
 # ============================================================================
 class Bot:
-    """Coveo Blitz Bot v5.0
+    """Coveo Blitz Bot v6.0
     
     主要改进：
-    ✅ 智能地图分类（解决 Cross 地图早死）
+    ✅ 智能地图分类
+    ✅ 扩张停滞检测
     ✅ 动态 2-biomass 策略
-    ✅ 改进的 neutral 处理
-    ✅ 更好的 emergency 逻辑
+    ✅ 激进生产模式
     """
 
     def __init__(self) -> None:
-        print("🚀 Initializing Bot v5.0 with Improved Map Analysis")
+        print("🚀 Initializing Bot v6.0 with Expansion Enhancement")
 
-        # 🗺️ Map analyzer
+        # 分析系统
         self.map_analyzer = ImprovedMapAnalysis()
+        self.expansion_enhancer = ExpansionEnhancement()
         self._map_type: str = ""
 
         # Cache
@@ -387,6 +450,45 @@ class Bot:
                 nutrient_grid=nutrient_grid
             )
 
+        # ---------- 🌍 Calculate expansion metrics ----------
+        my_tile_count = sum(
+            1
+            for row in ownership_grid
+            for owner in row
+            if owner == my_team_id
+        )
+
+        # 计算 nutrient generation (估算)
+        nutrient_generation = sum(
+            nutrient_grid[y][x]
+            for y in range(height)
+            for x in range(width)
+            if ownership_grid[y][x] == my_team_id
+        )
+
+        # 检测停滞
+        is_stagnant = self.expansion_enhancer.detect_expansion_stagnation(
+            current_territory=my_tile_count,
+            tick=self._tick_count
+        )
+
+        if is_stagnant and self._tick_count % 20 == 0:
+            print(f"🚨 [STAGNANT] Tick {self._tick_count}: Territory growth stalled! "
+                  f"(Territory: {my_tile_count}, Gen: {nutrient_generation})")
+
+        # 计算我方中心
+        spawner_pts: List[Point] = [_pos_to_point(s.position) for s in my_team.spawners]
+        if spawner_pts:
+            my_center = spawner_pts[0]
+        else:
+            my_positions = [_pos_to_point(s.position) for s in my_team.spores if s.biomass >= 2]
+            if my_positions:
+                avg_x = sum(p.x for p in my_positions) // len(my_positions)
+                avg_y = sum(p.y for p in my_positions) // len(my_positions)
+                my_center = Point(avg_x, avg_y)
+            else:
+                my_center = Point(width // 2, height // 2)
+
         # ---------- Threat map ----------
         threat_map: Dict[Point, int] = {}
         for ept, eb in enemy_biomass_at.items():
@@ -403,6 +505,17 @@ class Bot:
 
         def threat_at(pt: Point) -> int:
             return threat_map.get(pt, 0)
+
+        # ---------- 🎯 Calculate dynamic 2-biomass penalty ----------
+        penalty_2biomass = self.expansion_enhancer.improved_2biomass_penalty(
+            map_type=self._map_type,
+            tick=self._tick_count,
+            my_tile_count=my_tile_count,
+            total_tiles=width * height,
+            spawner_count=len(my_team.spawners),
+            is_stagnant=is_stagnant,
+            nutrient_generation=nutrient_generation
+        )
 
         # ---------- One-action-per-unit guards ----------
         used_spores: Set[str] = set()
@@ -423,7 +536,6 @@ class Bot:
         # ---------- Partition units ----------
         actionable_spores: List[Spore] = [s for s in my_team.spores if s.biomass >= 2]
         big_spores: List[Spore] = [s for s in my_team.spores if s.biomass >= 6]
-        spawner_pts: List[Point] = [_pos_to_point(s.position) for s in my_team.spawners]
 
         total_spores_now = len(my_team.spores)
         survival_mode = (
@@ -445,20 +557,7 @@ class Bot:
         # ---------- Map control ----------
         def get_control_rate() -> float:
             total_tiles = width * height
-            my_tiles = sum(
-                1
-                for row in ownership_grid
-                for owner in row
-                if owner == my_team_id
-            )
-            return my_tiles / total_tiles if total_tiles > 0 else 0.0
-
-        my_tile_count = sum(
-            1
-            for row in ownership_grid
-            for owner in row
-            if owner == my_team_id
-        )
+            return my_tile_count / total_tiles if total_tiles > 0 else 0.0
 
         # ---------- Spawner placement helpers ----------
         SITE_POOL_K = 60
@@ -482,7 +581,6 @@ class Bot:
             if builder_biomass <= 0:
                 return False
 
-            # Threat / margin logic
             if lenient or (self._total_spore_count or 3) <= 3:
                 margin = 0
             else:
@@ -491,7 +589,6 @@ class Bot:
             if threat_at(pt) >= builder_biomass - margin:
                 return False
 
-            # 🌟 敌人密度判断，避免在敌堆中建造
             if not lenient:
                 density = self.enemy_density_in_radius(pt, enemy_biomass_at, radius=5)
                 if density >= 6:
@@ -562,7 +659,6 @@ class Bot:
                 if sp.biomass < min_biomass_needed:
                     continue
 
-                # 确保 builder 起点也不要在必死格子里
                 if not lenient and (self._total_spore_count or 3) > 3:
                     if threat_at(_pos_to_point(sp.position)) >= sp.biomass:
                         continue
@@ -576,9 +672,8 @@ class Bot:
             return best
 
         builder_ids: Set[str] = set()
-# ---------- 🏗️ FIRST SPAWNER LOGIC (IMPROVED) ----------
+# ---------- 🏗️ FIRST SPAWNER LOGIC ----------
         if not out_of_time() and len(my_team.spawners) == 0 and actionable_spores:
-            # 使用新的地图分析决策
             should_build, min_needed, is_emergency = self.map_analyzer.should_build_first_spawner_v2(
                 map_type=self._map_type,
                 tick=self._tick_count,
@@ -594,9 +689,8 @@ class Bot:
                 print(f"🏗️  [BUILDING] Tick {self._tick_count}, Map: {self._map_type}, "
                       f"Min biomass: {min_needed}, Emergency: {is_emergency}")
 
-                # 根据地图类型调整 hint_biomass
                 if self._map_type == "blocked_small":
-                    hint_biomass = max(min_needed, 4)  # blocked 地图需要更多 biomass
+                    hint_biomass = max(min_needed, 4)
                 elif (self._total_spore_count or 3) <= 3:
                     hint_biomass = max(min_needed, 3)
                 else:
@@ -667,7 +761,7 @@ class Bot:
                 else:
                     print("🛑 [CANCEL] No valid site for first spawner")
             else:
-                if self._tick_count % 10 == 0:  # 每 10 tick 报告一次
+                if self._tick_count % 10 == 0:
                     print(f"⏳ [WAITING] Tick {self._tick_count}, Map: {self._map_type}, "
                           f"Neutrals: {len(neutral_spores)}, Actionable: {len(actionable_spores)}")
 
@@ -814,25 +908,7 @@ class Bot:
         if out_of_time():
             return actions
 
-        # ---------- 🏭 Spawner production ----------
-        def calculate_spawner_production(local_threat: int, spore_count: int, nutrients_now: int) -> int:
-            base = 4
-
-            if self._tick_count < 200 and spore_count < 15:
-                base = max(6, nutrients_now // 8)
-
-            if local_threat > 0:
-                base = max(base, local_threat + 3)
-
-            if 200 <= self._tick_count < 500 and nutrients_now > 50:
-                base = max(base, 7)
-
-            # 🌋 高资源爆兵阶段
-            if self._tick_count >= 800 and nutrients_now >= 2000:
-                base = max(base, 12)
-
-            return min(base, nutrients_now - 2)
-
+        # ---------- 🏭 AGGRESSIVE SPAWNER PRODUCTION ----------
         if (self._total_spore_count or 3) <= 3:
             reserve_nutrients = 2
         else:
@@ -851,7 +927,17 @@ class Bot:
                 if _in_bounds(nx, ny, width, height):
                     local_threat = max(local_threat, threat_at(Point(nx, ny)))
 
-            desired = calculate_spawner_production(local_threat, len(my_team.spores), nutrients)
+            # 🌟 使用激进生产策略
+            desired = self.expansion_enhancer.aggressive_spawner_production(
+                tick=self._tick_count,
+                local_threat=local_threat,
+                spore_count=len(my_team.spores),
+                nutrients=nutrients,
+                my_territory_count=my_tile_count,
+                total_tiles=width * height,
+                is_stagnant=is_stagnant,
+                nutrient_generation=nutrient_generation
+            )
 
             if nutrients - desired < reserve_nutrients:
                 continue
@@ -920,7 +1006,7 @@ class Bot:
         if out_of_time():
             return actions
 
-        # ---------- 📐 BFS parameters (dynamic based on time) ----------
+        # ---------- 📐 BFS parameters ----------
         def get_bfs_params() -> Dict[str, int]:
             if self._tick_count < 100:
                 return {"depth": 7, "nodes": 250, "spore_limit": 10}
@@ -940,15 +1026,7 @@ class Bot:
                 return 2
             return 1
 
-        # 🎯 获取动态 2-biomass 惩罚
-        penalty_2biomass = self.map_analyzer.calculate_2biomass_penalty(
-            map_type=self._map_type,
-            tick=self._tick_count,
-            my_tile_count=my_tile_count,
-            total_tiles=width * height,
-            spawner_count=len(my_team.spawners)
-        )
-
+        # ---------- 🎯 IMPROVED SCORING FUNCTION ----------
         def _score_tile_for_spore(
             sp: Spore,
             pt: Point,
@@ -960,7 +1038,6 @@ class Bot:
         ) -> int:
             tv = tile_value(pt)
             owner = tile_owner(pt)
-            tb = tile_biomass(pt)
 
             enemy_here = enemy_biomass_at.get(pt, 0)
             thr = threat_at(pt)
@@ -970,14 +1047,17 @@ class Bot:
 
             score = 0
 
+            # ⚔️ 战斗加分
             if enemy_here > 0:
                 if sp.biomass <= enemy_here:
                     return -10**9
                 score += 450 + (sp.biomass - enemy_here) * 5
 
-            score -= thr * 45
-            score -= adjacent_enemy_max(pt) * 25
+            # 🛡️ 威胁惩罚（降低）
+            score -= thr * 30  # 从 45 降低
+            score -= adjacent_enemy_max(pt) * 20  # 从 25 降低
 
+            # 🎯 角色特定评分
             if is_hunter:
                 if enemy_here > 0:
                     score += 300
@@ -987,17 +1067,31 @@ class Bot:
                 score += tv // 2
                 score -= _manhattan(pt, defend_center) * 35
             else:
-                score += tv * 3
+                # 🌟 普通扩张模式 - 关键改进
+                score += tv * 4  # 从 3 提高到 4
+                
                 if owner != my_team_id:
-                    score += 80
+                    score += 120  # 从 80 提高 - 更吸引未控制地块
+                
+                # 🌍 扩张加分
+                expansion_bonus = self.expansion_enhancer.calculate_expansion_bonus(
+                    pt=pt,
+                    my_center=my_center,
+                    my_territory_count=my_tile_count,
+                    total_tiles=width * height,
+                    is_stagnant=is_stagnant
+                )
+                score += expansion_bonus
 
-            score -= dist * 25
-            score -= path_cost * 35
+            # 📏 距离惩罚（降低）
+            score -= dist * 18  # 从 25 降低
+            score -= path_cost * 25  # 从 35 降低
 
+            # 🚀 免费路径奖励
             if path_cost == 0 and dist > 0:
-                score += (BFS_MAX_DEPTH - dist) * 5
+                score += (BFS_MAX_DEPTH - dist) * 8
 
-            # 🎯 使用动态 2-biomass 惩罚
+            # 🎯 2-biomass 惩罚（使用动态版本）
             if sp.biomass == 2 and _approx_step_cost(pt) == 1:
                 score -= penalty_2biomass
 
@@ -1137,8 +1231,7 @@ class Bot:
                     continue
 
                 add_action_for_spore(s.id, SporeMoveAction(sporeId=s.id, direction=step))
-
-        # ---------- 🎯 Main movement logic ----------
+# ---------- 🎯 MAIN MOVEMENT LOGIC ----------
         bfs_used = 0
         for sp in actionable_sorted:
             if out_of_time():
@@ -1157,6 +1250,7 @@ class Bot:
 
             best_dir: Optional[Position] = None
 
+            # 尝试 BFS
             if bfs_used < BFS_SPORE_LIMIT and time_left() > 0.020:
                 best_dir = limited_bfs_first_step(
                     sp,
@@ -1166,6 +1260,7 @@ class Bot:
                 )
                 bfs_used += 1
 
+            # 如果 BFS 没找到方向，使用贪心搜索
             if best_dir is None:
                 pt = _pos_to_point(sp.position)
                 best_score = -10**18
@@ -1192,6 +1287,8 @@ class Bot:
                             continue
 
                         score = 0
+                        
+                        # 角色评分
                         if is_hunter:
                             if enemy_here > 0:
                                 score += 450 + (sp.biomass - enemy_here) * 5
@@ -1201,9 +1298,21 @@ class Bot:
                             score += (30 if tile_owner(npt) == my_team_id else 0)
                             score += tile_value(npt) // 2
                         else:
-                            score += tile_value(npt) * 3
+                            # 🌟 普通扩张模式 - 改进评分
+                            score += tile_value(npt) * 4  # 提高地块价值权重
+                            
                             if tile_owner(npt) != my_team_id:
-                                score += 70
+                                score += 120  # 提高未控制地块吸引力
+                            
+                            # 🌍 扩张加分
+                            expansion_bonus = self.expansion_enhancer.calculate_expansion_bonus(
+                                pt=npt,
+                                my_center=my_center,
+                                my_territory_count=my_tile_count,
+                                total_tiles=width * height,
+                                is_stagnant=is_stagnant
+                            )
+                            score += expansion_bonus
 
                         if move_cost == 0:
                             score += 15
@@ -1211,10 +1320,11 @@ class Bot:
                         if enemy_here > 0 and sp.biomass > enemy_here:
                             score += 450 + (sp.biomass - enemy_here) * 5
 
-                        score -= threat_at(npt) * 45
-                        score -= adjacent_enemy_max(npt) * 25
+                        # 威胁惩罚（降低）
+                        score -= threat_at(npt) * 30  # 从 45 降低
+                        score -= adjacent_enemy_max(npt) * 20  # 从 25 降低
 
-                        # 🎯 使用动态惩罚
+                        # 🎯 动态 2-biomass 惩罚
                         if sp.biomass == 2 and move_cost == 1:
                             score -= penalty_2biomass
 
@@ -1228,9 +1338,11 @@ class Bot:
                     if best_dir is not None:
                         break
 
+            # 执行移动
             if best_dir is not None:
                 add_action_for_spore(sp.id, SporeMoveAction(sporeId=sp.id, direction=best_dir))
             else:
+                # ---------- 兜底逻辑 ----------
                 if is_defender and defend_center is not None:
                     add_action_for_spore(
                         sp.id,
@@ -1240,6 +1352,7 @@ class Bot:
                         ),
                     )
                 else:
+                    # 寻找最近的高价值地块
                     pool = self._top_tiles_cache[:25]
                     sp_pt = _pos_to_point(sp.position)
                     best_t: Optional[Point] = None
