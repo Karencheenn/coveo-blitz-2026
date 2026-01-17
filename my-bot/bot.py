@@ -49,27 +49,202 @@ def _manhattan(a: Point, b: Point) -> int:
 _GLOBAL_TOP_TILES_CACHE: Dict[Tuple[int, int], List[Point]] = {}
 
 
-class Bot:
+# ============================================================================
+# 🗺️ IMPROVED MAP ANALYSIS CLASS
+# ============================================================================
+class ImprovedMapAnalysis:
     """
-    Enhanced bot v4.3 - Stable + Stronger Early Game
-
-    NEW FIXES:
-    1. ✅ Lower biomass requirements (min_needed from cost+2 to cost+1)
-    2. ✅ Emergency builder at tick 20+ (use ANY available spore)
-    3. ✅ Better initial spore count detection (count ALL spores, not just actionable)
-    4. ✅ Detailed logging for debugging
-    5. ✅ Fallback builder selection (if ideal fails, try weaker spores)
-
-    v4.3 重点改动：
-    - ✅ 修复一个会导致提前崩溃的 return 拼写错误（tick 早断的主要原因之一）
-    - ✅ Survival Guard（低单位数时更保守，避免全灭）
-    - ✅ 提前建 Spawner 时机（tick 3-5 开始启动）
-    - ✅ 加强 2-biomass 移动惩罚（避免 2->1 后无法再动）
-    - ⭐ Emergency Merge（濒危单位主动合并，提高存活率）
+    改进的地图分析系统
+    - 智能识别地图类型（open_rush, blocked_small, medium, large）
+    - 动态调整建造时机
+    - 自适应 2-biomass 惩罚
     """
-
+    
     def __init__(self):
-        print("🚀 Initializing ENHANCED bot v4.3 - Stable + Stronger Early Game")
+        self._map_type_cache: Dict[Tuple[int, int], str] = {}
+    
+    def analyze_map_type(
+        self, 
+        width: int, 
+        height: int,
+        neutral_spores: List[Tuple[Point, int]],
+        my_spore_count: int,
+        nutrient_grid: List[List[int]]
+    ) -> str:
+        """
+        识别地图类型：
+        - "open_rush": 开阔小图，适合快速建造
+        - "blocked_small": 有障碍的小图（Cross等），需要先清理
+        - "medium": 中型图
+        - "large": 大型图
+        """
+        key = (width, height)
+        if key in self._map_type_cache:
+            return self._map_type_cache[key]
+        
+        area = width * height
+        
+        # 计算中心区域的 neutral 密度
+        center_x, center_y = width // 2, height // 2
+        center_neutrals = sum(
+            1 for pt, _ in neutral_spores
+            if abs(pt.x - center_x) <= 3 and abs(pt.y - center_y) <= 3
+        )
+        
+        # 计算总 neutral 数量
+        total_neutrals = len(neutral_spores)
+        
+        # 分类逻辑
+        if area <= 225:  # 小图 (15x15 或更小)
+            # Cross 类型检测：中心有密集 neutral
+            if center_neutrals >= 5 or total_neutrals >= 8:
+                map_type = "blocked_small"
+                print(f"🗺️  Map Type: BLOCKED_SMALL (neutrals: {total_neutrals}, center: {center_neutrals})")
+            else:
+                map_type = "open_rush"
+                print(f"🗺️  Map Type: OPEN_RUSH (area: {area})")
+        elif area <= 900:  # 中型图 (30x30 或更小)
+            map_type = "medium"
+            print(f"🗺️  Map Type: MEDIUM (area: {area})")
+        else:
+            map_type = "large"
+            print(f"🗺️  Map Type: LARGE (area: {area})")
+        
+        self._map_type_cache[key] = map_type
+        return map_type
+    
+    def should_build_first_spawner_v2(
+        self,
+        map_type: str,
+        tick: int,
+        actionable_count: int,
+        max_biomass: int,
+        next_spawner_cost: int,
+        total_spore_count: int,
+        neutral_count: int,
+        my_nutrients: int
+    ) -> Tuple[bool, int, bool]:
+        """
+        返回: (should_build, min_biomass_needed, is_emergency)
+        
+        改进点：
+        1. blocked_small 地图延迟建造
+        2. 确保有足够单位存活
+        3. Emergency 模式更宽松
+        """
+        
+        # 🚨 Emergency 条件
+        is_emergency = tick >= 20
+        
+        if map_type == "open_rush":
+            # 真正的小图 rush
+            if tick >= 2 and actionable_count >= 1 and max_biomass >= next_spawner_cost:
+                return (True, next_spawner_cost + 1, False)
+        
+        elif map_type == "blocked_small":
+            # Cross 等有障碍的小图 - 关键改进！
+            
+            # ⚠️ 核心逻辑：如果有很多 neutral，必须等待
+            if neutral_count >= 5:
+                # 策略1：等到有多个单位再建造
+                if tick >= 15 and actionable_count >= 2 and max_biomass >= next_spawner_cost + 2:
+                    return (True, max(next_spawner_cost + 2, 4), False)
+                # 策略2：Emergency 模式但要求更高
+                elif tick >= 25 and actionable_count >= 1 and max_biomass >= 3:
+                    return (True, max(next_spawner_cost, 3), True)
+                # 否则继续等待
+                return (False, 0, False)
+            else:
+                # neutral 已清理大部分，可以建造
+                if tick >= 5 and actionable_count >= 1 and max_biomass >= next_spawner_cost + 1:
+                    return (True, next_spawner_cost + 1, False)
+        
+        elif map_type == "medium":
+            # 中型图
+            if total_spore_count <= 6:
+                if actionable_count >= 2 or tick > 15:
+                    return (True, max(next_spawner_cost + 1, 4), False)
+            else:
+                if actionable_count >= 3 or tick > 20:
+                    return (True, max(next_spawner_cost + 1, 5), False)
+        
+        else:  # large
+            if actionable_count >= 4 or tick > 25:
+                return (True, max(next_spawner_cost + 2, 6), False)
+        
+        # Emergency fallback - 但要确保不会自杀
+        if is_emergency and actionable_count >= 1:
+            # 确保建造后还有 actionable spores
+            if max_biomass >= next_spawner_cost + 2:
+                return (True, max(3, next_spawner_cost), True)
+        
+        return (False, 0, False)
+    
+    def calculate_2biomass_penalty(
+        self,
+        map_type: str,
+        tick: int,
+        my_tile_count: int,
+        total_tiles: int,
+        spawner_count: int
+    ) -> int:
+        """
+        动态调整 2-biomass 移动惩罚
+        
+        原则：
+        - 早期需要扩张 -> 低惩罚
+        - 控制率低 -> 低惩罚  
+        - 后期 + 有 spawner -> 高惩罚（保护单位）
+        """
+        control_rate = my_tile_count / total_tiles if total_tiles > 0 else 0
+        
+        # 早期阶段：必须扩张
+        if tick < 50:
+            if map_type == "blocked_small":
+                # Cross 等地图早期更需要移动清理 neutral
+                return 150
+            elif map_type == "open_rush":
+                return 200
+            return 300
+        
+        # 中期：根据控制率调整
+        if tick < 200:
+            if control_rate < 0.15:
+                return 250  # 控制率太低，必须扩张
+            elif control_rate < 0.30:
+                return 400
+            else:
+                return 600
+        
+        # 后期：保护模式
+        if tick >= 500:
+            if spawner_count >= 2:
+                return 900  # 有经济了，保护单位
+            return 700
+        
+        # 默认中等惩罚
+        return 500
+
+
+# ============================================================================
+# 🤖 MAIN BOT CLASS
+# ============================================================================
+class Bot:
+    """Coveo Blitz Bot v5.0
+    
+    主要改进：
+    ✅ 智能地图分类（解决 Cross 地图早死）
+    ✅ 动态 2-biomass 策略
+    ✅ 改进的 neutral 处理
+    ✅ 更好的 emergency 逻辑
+    """
+
+    def __init__(self) -> None:
+        print("🚀 Initializing Bot v5.0 with Improved Map Analysis")
+
+        # 🗺️ Map analyzer
+        self.map_analyzer = ImprovedMapAnalysis()
+        self._map_type: str = ""
 
         # Cache
         self._cached_map_key: Optional[Tuple[int, int]] = None
@@ -80,19 +255,35 @@ class Bot:
         self._planned_sites: Dict[str, Point] = {}
         self._builder_target_by_id: Dict[str, Point] = {}
 
-        # Timing tracking
+        # Timing / stats
         self._first_spawner_tick: Optional[int] = None
         self._tick_count: int = 0
         self._initial_spore_count: Optional[int] = None
-        self._total_spore_count: Optional[int] = None  # Track ALL spores
+        self._total_spore_count: Optional[int] = None
+# ----------------------
+    # Helper methods
+    # ----------------------
+    def enemy_density_in_radius(
+        self,
+        center: Point,
+        enemy_map: Dict[Point, int],
+        radius: int = 5,
+    ) -> int:
+        """统计某点半径内的敌人格子数"""
+        c = 0
+        for pt in enemy_map:
+            if _manhattan(center, pt) <= radius:
+                c += 1
+        return c
 
-    def get_next_move(self, game_message: TeamGameState) -> list[Action]:
+    # ----------------------
+    # Core decision loop
+    # ----------------------
+    def get_next_move(self, game_message: TeamGameState) -> List[Action]:
         actions: List[Action] = []
         self._tick_count = game_message.tick
 
-        # =========================
-        # Tick time budget
-        # =========================
+        # Tick 时间预算
         TICK_BUDGET_SEC = 0.085
         tick_start = time.perf_counter()
 
@@ -117,18 +308,18 @@ class Bot:
         ownership_grid = world.ownershipGrid
         biomass_grid = world.biomassGrid
 
-        # Track BOTH actionable and total spore counts
+        # 初次记录 spore 数量
         if self._total_spore_count is None and self._tick_count == 1:
             self._total_spore_count = len(my_team.spores)
             self._initial_spore_count = len([s for s in my_team.spores if s.biomass >= 2])
-            print(f"📊 [INIT] Total spores: {self._total_spore_count}, Actionable: {self._initial_spore_count}")
+            print(
+                f"📊 [INIT] Total spores: {self._total_spore_count}, "
+                f"Actionable: {self._initial_spore_count}"
+            )
 
-        # ---------------------------------------------------------
-        # Cache top tiles
-        # ---------------------------------------------------------
+        # ---------- Nutrient cache ----------
         def _ensure_top_tiles_cache() -> None:
             key = (width, height)
-
             if key in _GLOBAL_TOP_TILES_CACHE and _GLOBAL_TOP_TILES_CACHE[key]:
                 self._cached_map_key = key
                 self._top_tiles_cache = _GLOBAL_TOP_TILES_CACHE[key]
@@ -138,7 +329,11 @@ class Bot:
                 _GLOBAL_TOP_TILES_CACHE[key] = self._top_tiles_cache
                 return
 
-            pts: List[Point] = [Point(x, y) for y in range(height) for x in range(width)]
+            pts: List[Point] = [
+                Point(x, y)
+                for y in range(height)
+                for x in range(width)
+            ]
             pts.sort(key=lambda p: nutrient_grid[p.y][p.x], reverse=True)
             pts = pts[: self._top_tiles_k]
 
@@ -157,9 +352,7 @@ class Bot:
         def tile_biomass(pt: Point) -> int:
             return biomass_grid[pt.y][pt.x]
 
-        # ---------------------------------------------------------
-        # Index units
-        # ---------------------------------------------------------
+        # ---------- Index units ----------
         enemy_biomass_at: Dict[Point, int] = {}
         my_biomass_at: Dict[Point, int] = {}
         neutral_spores: List[Tuple[Point, int]] = []
@@ -184,9 +377,17 @@ class Bot:
                     m = max(m, enemy_biomass_at.get(Point(nx, ny), 0))
             return m
 
-        # ---------------------------------------------------------
-        # Threat map
-        # ---------------------------------------------------------
+        # ---------- 🗺️ Map Type Analysis (First tick only) ----------
+        if not self._map_type:
+            self._map_type = self.map_analyzer.analyze_map_type(
+                width=width,
+                height=height,
+                neutral_spores=neutral_spores,
+                my_spore_count=len(my_team.spores),
+                nutrient_grid=nutrient_grid
+            )
+
+        # ---------- Threat map ----------
         threat_map: Dict[Point, int] = {}
         for ept, eb in enemy_biomass_at.items():
             prev = threat_map.get(ept, 0)
@@ -203,9 +404,7 @@ class Bot:
         def threat_at(pt: Point) -> int:
             return threat_map.get(pt, 0)
 
-        # ---------------------------------------------------------
-        # One action per unit
-        # ---------------------------------------------------------
+        # ---------- One-action-per-unit guards ----------
         used_spores: Set[str] = set()
         used_spawners: Set[str] = set()
 
@@ -221,82 +420,47 @@ class Bot:
             used_spawners.add(spawner_id)
             actions.append(action)
 
-        # ---------------------------------------------------------
-        # Partition units
-        # ---------------------------------------------------------
+        # ---------- Partition units ----------
         actionable_spores: List[Spore] = [s for s in my_team.spores if s.biomass >= 2]
         big_spores: List[Spore] = [s for s in my_team.spores if s.biomass >= 6]
         spawner_pts: List[Point] = [_pos_to_point(s.position) for s in my_team.spawners]
 
-        # ---------------------------------------------------------
-        # ✅ Survival Guard：防止全灭（尤其是资源少的小图）
-        # ---------------------------------------------------------
         total_spores_now = len(my_team.spores)
         survival_mode = (
-            (len(my_team.spawners) == 0 and total_spores_now <= 2) or
-            (len(my_team.spawners) > 0 and total_spores_now <= 1)
+            (len(my_team.spawners) == 0 and total_spores_now <= 2)
+            or (len(my_team.spawners) > 0 and total_spores_now <= 1)
         )
 
-        # Track first spawner timing
         if len(my_team.spawners) > 0 and self._first_spawner_tick is None:
             self._first_spawner_tick = self._tick_count
             print(f"🏗️  [SUCCESS] First spawner built at tick {self._tick_count}")
 
-        # Debug: Log state if no spawner by tick 20
         if self._tick_count == 20 and len(my_team.spawners) == 0:
             print(f"⚠️  [TICK 20 WARNING] Still no spawner!")
+            print(f"   Map type: {self._map_type}")
             print(f"   Nutrients: {nutrients}, Next cost: {next_spawner_cost}")
             print(f"   Actionable spores: {len(actionable_spores)}")
-            print(f"   Spores: {[(s.biomass, _pos_to_point(s.position)) for s in actionable_spores]}")
+            print(f"   Neutral count: {len(neutral_spores)}")
 
-        # ---------------------------------------------------------
-        # Helper: Calculate map control rate
-        # ---------------------------------------------------------
+        # ---------- Map control ----------
         def get_control_rate() -> float:
             total_tiles = width * height
-            my_tiles = sum(1 for row in ownership_grid for owner in row if owner == my_team_id)
+            my_tiles = sum(
+                1
+                for row in ownership_grid
+                for owner in row
+                if owner == my_team_id
+            )
             return my_tiles / total_tiles if total_tiles > 0 else 0.0
 
-        # ---------------------------------------------------------
-        # ✅ MUST 改：提前建 Spawner（tick 3-5 启动）
-        # ---------------------------------------------------------
-        def should_build_first_spawner() -> bool:
-            if len(my_team.spawners) > 0:
-                return False
+        my_tile_count = sum(
+            1
+            for row in ownership_grid
+            for owner in row
+            if owner == my_team_id
+        )
 
-            initial_count = self._total_spore_count or 3
-            current_actionable = len(actionable_spores)
-
-            if initial_count <= 3:
-                max_bio = max((s.biomass for s in actionable_spores), default=0)
-
-                # tick>=3：如果已经有人够 cost，立刻启动建造
-                if self._tick_count >= 3 and max_bio >= next_spawner_cost:
-                    print(f"🔥 [SMALL MAP EARLY] Start spawner plan at tick {self._tick_count}")
-                    return True
-
-                # tick>=5：如果还不够 cost，但至少有 2 个可动单位，提前派一个去站位
-                if self._tick_count >= 5 and current_actionable >= 2:
-                    print(f"🔥 [SMALL MAP EARLY] Pre-position builder at tick {self._tick_count}")
-                    return True
-
-                if current_actionable >= 2:
-                    return True
-                return False
-
-            if initial_count <= 6:
-                if current_actionable >= 2 or self._tick_count > 15:
-                    return True
-                return False
-
-            if current_actionable >= 4 or self._tick_count > 25:
-                return True
-
-            return False
-
-        # ---------------------------------------------------------
-        # Spawner placement helpers
-        # ---------------------------------------------------------
+        # ---------- Spawner placement helpers ----------
         SITE_POOL_K = 60
         ENEMY_DIST_CAP = 40
         ENEMY_SAMPLE_CAP = 60
@@ -318,6 +482,7 @@ class Bot:
             if builder_biomass <= 0:
                 return False
 
+            # Threat / margin logic
             if lenient or (self._total_spore_count or 3) <= 3:
                 margin = 0
             else:
@@ -325,6 +490,12 @@ class Bot:
 
             if threat_at(pt) >= builder_biomass - margin:
                 return False
+
+            # 🌟 敌人密度判断，避免在敌堆中建造
+            if not lenient:
+                density = self.enemy_density_in_radius(pt, enemy_biomass_at, radius=5)
+                if density >= 6:
+                    return False
 
             if lenient:
                 return True
@@ -364,6 +535,7 @@ class Bot:
             pool = self._top_tiles_cache[:SITE_POOL_K]
             best: Optional[Point] = None
             best_score = -10**18
+
             for pt in pool:
                 if pt in spawner_pts:
                     continue
@@ -390,6 +562,7 @@ class Bot:
                 if sp.biomass < min_biomass_needed:
                     continue
 
+                # 确保 builder 起点也不要在必死格子里
                 if not lenient and (self._total_spore_count or 3) > 3:
                     if threat_at(_pos_to_point(sp.position)) >= sp.biomass:
                         continue
@@ -403,55 +576,64 @@ class Bot:
             return best
 
         builder_ids: Set[str] = set()
+# ---------- 🏗️ FIRST SPAWNER LOGIC (IMPROVED) ----------
+        if not out_of_time() and len(my_team.spawners) == 0 and actionable_spores:
+            # 使用新的地图分析决策
+            should_build, min_needed, is_emergency = self.map_analyzer.should_build_first_spawner_v2(
+                map_type=self._map_type,
+                tick=self._tick_count,
+                actionable_count=len(actionable_spores),
+                max_biomass=max((s.biomass for s in actionable_spores), default=0),
+                next_spawner_cost=next_spawner_cost,
+                total_spore_count=len(my_team.spores),
+                neutral_count=len(neutral_spores),
+                my_nutrients=nutrients
+            )
 
-        # ---------------------------------------------------------
-        # FIRST SPAWNER - Early + Emergency fallback
-        # ---------------------------------------------------------
-        if not out_of_time() and should_build_first_spawner() and actionable_spores:
-            min_needed = next_spawner_cost + 1  # cost+1 更激进
+            if should_build:
+                print(f"🏗️  [BUILDING] Tick {self._tick_count}, Map: {self._map_type}, "
+                      f"Min biomass: {min_needed}, Emergency: {is_emergency}")
 
-            is_emergency = self._tick_count >= 20
-            if is_emergency:
-                print(f"🚨 [EMERGENCY MODE] Tick {self._tick_count}, forcing spawner build!")
-                min_needed = max(next_spawner_cost, 2)
+                # 根据地图类型调整 hint_biomass
+                if self._map_type == "blocked_small":
+                    hint_biomass = max(min_needed, 4)  # blocked 地图需要更多 biomass
+                elif (self._total_spore_count or 3) <= 3:
+                    hint_biomass = max(min_needed, 3)
+                else:
+                    hint_biomass = max(min_needed, 6)
 
-            if (self._total_spore_count or 3) <= 3:
-                hint_biomass = max(min_needed, 3)
-            else:
-                hint_biomass = max(min_needed, 6)
-
-            locked = self._planned_sites.get("first")
-            if locked is None or not site_still_valid(locked, hint_biomass):
-                locked = pick_best_site(is_second=False, builder_biomass_hint=hint_biomass, lenient=is_emergency)
-
-                if locked is None and len(self._top_tiles_cache) > 0:
-                    print(f"⚠️  [FALLBACK] No safe site found, trying lenient mode...")
-                    locked = pick_best_site(is_second=False, builder_biomass_hint=2, lenient=True)
+                locked = self._planned_sites.get("first")
+                if locked is None or not site_still_valid(locked, hint_biomass):
+                    locked = pick_best_site(is_second=False, builder_biomass_hint=hint_biomass, lenient=is_emergency)
+                    if locked is None and self._top_tiles_cache:
+                        print("⚠️  [FALLBACK] No safe site found, trying lenient mode...")
+                        locked = pick_best_site(is_second=False, builder_biomass_hint=2, lenient=True)
+                    if locked is not None:
+                        self._planned_sites["first"] = locked
+                        print(f"📍 [SITE] Selected spawner site at {locked} (value: {tile_value(locked)})")
 
                 if locked is not None:
-                    self._planned_sites["first"] = locked
-                    print(f"📍 [SITE] Selected spawner site at {locked} (value: {tile_value(locked)})")
+                    builder = pick_builder_spore(
+                        site=locked,
+                        min_biomass_needed=min_needed,
+                        avoid_ids=set(),
+                        lenient=is_emergency,
+                    )
 
-            if locked is not None:
-                builder = pick_builder_spore(site=locked, min_biomass_needed=min_needed, avoid_ids=set(), lenient=is_emergency)
+                    if builder is None and is_emergency:
+                        print("⚠️  [FALLBACK] No ideal builder, trying with lower biomass...")
+                        builder = pick_builder_spore(
+                            site=locked,
+                            min_biomass_needed=2,
+                            avoid_ids=set(),
+                            lenient=True,
+                        )
 
-                if builder is None and is_emergency:
-                    print(f"⚠️  [FALLBACK] No ideal builder, trying with min=2 biomass...")
-                    builder = pick_builder_spore(site=locked, min_biomass_needed=2, avoid_ids=set(), lenient=True)
+                    if builder is None and is_emergency and actionable_spores:
+                        print("🚨 [EMERGENCY FALLBACK] Using strongest available spore!")
+                        builder = max(actionable_spores, key=lambda s: s.biomass)
 
-                if builder is None and is_emergency and actionable_spores:
-                    print(f"🚨 [EMERGENCY FALLBACK] Using strongest available spore!")
-                    builder = max(actionable_spores, key=lambda s: s.biomass)
-
-                if builder is not None:
-                    should_send = True
-                    if not is_emergency and (self._total_spore_count or 3) > 3:
-                        builder_pt = _pos_to_point(builder.position)
-                        nearby_threats = [eb for ept, eb in enemy_list if _manhattan(builder_pt, ept) <= 4]
-                        max_nearby_threat = max(nearby_threats) if nearby_threats else 0
-                        should_send = builder.biomass > max_nearby_threat + 1
-
-                    if should_send:
+                    if builder is not None:
                         builder_ids.add(builder.id)
                         self._builder_target_by_id[builder.id] = locked
 
@@ -459,25 +641,40 @@ class Bot:
                         if bpt == locked:
                             if builder.biomass >= next_spawner_cost:
                                 add_action_for_spore(builder.id, SporeCreateSpawnerAction(sporeId=builder.id))
-                                print(f"✅ [SPAWNER] Built at tick {self._tick_count} with {builder.biomass} biomass")
+                                print(
+                                    f"✅ [SPAWNER] Built at tick {self._tick_count} "
+                                    f"with {builder.biomass} biomass (cost: {next_spawner_cost})"
+                                )
                             else:
-                                print(f"⚠️  Builder at site but only has {builder.biomass} biomass (need {next_spawner_cost})")
+                                print(
+                                    f"⚠️  Builder at site but only has {builder.biomass} "
+                                    f"biomass (need {next_spawner_cost})"
+                                )
                         else:
                             add_action_for_spore(
                                 builder.id,
-                                SporeMoveToAction(sporeId=builder.id, position=Position(x=locked.x, y=locked.y)),
+                                SporeMoveToAction(
+                                    sporeId=builder.id,
+                                    position=Position(x=locked.x, y=locked.y),
+                                ),
                             )
-                            print(f"🚀 [MOVING] Builder (biomass {builder.biomass}) heading to site at {locked}")
+                            print(
+                                f"🚀 [MOVING] Builder (biomass {builder.biomass}) "
+                                f"heading to site at {locked}"
+                            )
                     else:
-                        print(f"⚠️  Builder too weak to send (biomass: {builder.biomass})")
+                        print("❌ [ERROR] No builder found! Actionable spores:", len(actionable_spores))
                 else:
-                    print(f"❌ [ERROR] No builder found! Actionable spores: {len(actionable_spores)}")
+                    print("🛑 [CANCEL] No valid site for first spawner")
             else:
-                print(f"❌ [ERROR] No valid site found!")
+                if self._tick_count % 10 == 0:  # 每 10 tick 报告一次
+                    print(f"⏳ [WAITING] Tick {self._tick_count}, Map: {self._map_type}, "
+                          f"Neutrals: {len(neutral_spores)}, Actionable: {len(actionable_spores)}")
 
-        # ---------------------------------------------------------
-        # SECOND SPAWNER - Improved timing
-        # ---------------------------------------------------------
+        if out_of_time():
+            return actions
+
+        # ---------- 🏗️ SECOND SPAWNER ----------
         def should_build_second_spawner() -> bool:
             if len(my_team.spawners) != 1:
                 return False
@@ -487,8 +684,7 @@ class Bot:
 
             if (self._total_spore_count or 3) <= 3:
                 return (control_rate > 0.15 and nutrients >= 10) or (nutrients >= 15 and spawner_age > 10)
-            else:
-                return (control_rate > 0.25 and nutrients >= 20) or (nutrients >= 25 and spawner_age > 15)
+            return (control_rate > 0.25 and nutrients >= 20) or (nutrients >= 25 and spawner_age > 15)
 
         if not out_of_time() and should_build_second_spawner() and actionable_spores:
             min_needed2 = next_spawner_cost + 2
@@ -501,7 +697,11 @@ class Bot:
                     self._planned_sites["second"] = locked2
 
             if locked2 is not None:
-                builder2 = pick_builder_spore(site=locked2, min_biomass_needed=min_needed2, avoid_ids=builder_ids)
+                builder2 = pick_builder_spore(
+                    site=locked2,
+                    min_biomass_needed=min_needed2,
+                    avoid_ids=builder_ids,
+                )
                 if builder2 is not None:
                     builder_ids.add(builder2.id)
                     self._builder_target_by_id[builder2.id] = locked2
@@ -512,17 +712,18 @@ class Bot:
                     else:
                         add_action_for_spore(
                             builder2.id,
-                            SporeMoveToAction(sporeId=builder2.id, position=Position(x=locked2.x, y=locked2.y)),
+                            SporeMoveToAction(
+                                sporeId=builder2.id,
+                                position=Position(x=locked2.x, y=locked2.y),
+                            ),
                         )
 
         if out_of_time():
             return actions
 
-        # ---------------------------------------------------------
-        # Combat: Find soft targets
-        # ---------------------------------------------------------
+        # ---------- ⚔️ Combat targeting ----------
         def find_soft_targets() -> List[Tuple[Point, int, str, int]]:
-            targets = []
+            targets: List[Tuple[Point, int, str, int]] = []
 
             for enemy_pt, enemy_bio in enemy_list:
                 attackers = [
@@ -565,16 +766,16 @@ class Bot:
                 hunter_ids.add(attacker_id)
                 add_action_for_spore(
                     attacker_id,
-                    SporeMoveToAction(sporeId=attacker_id, position=Position(x=target_pt.x, y=target_pt.y))
+                    SporeMoveToAction(
+                        sporeId=attacker_id,
+                        position=Position(x=target_pt.x, y=target_pt.y),
+                    ),
                 )
 
         if out_of_time():
-            # ✅ 重要修复：这里原来是 `return actio`，会在超时分支直接 NameError 导致 websocket 提前断开
             return actions
 
-        # ---------------------------------------------------------
-        # Layered defense
-        # ---------------------------------------------------------
+        # ---------- 🛡️ Defense around spawners ----------
         defender_ids: Set[str] = set()
 
         if spawner_pts and actionable_spores:
@@ -613,22 +814,24 @@ class Bot:
         if out_of_time():
             return actions
 
-        # ---------------------------------------------------------
-        # SpawnerProduceSpore - Dynamic production
-        # ---------------------------------------------------------
-        def calculate_spawner_production(local_threat: int, spore_count: int) -> int:
+        # ---------- 🏭 Spawner production ----------
+        def calculate_spawner_production(local_threat: int, spore_count: int, nutrients_now: int) -> int:
             base = 4
 
             if self._tick_count < 200 and spore_count < 15:
-                base = max(6, nutrients // 8)
+                base = max(6, nutrients_now // 8)
 
             if local_threat > 0:
                 base = max(base, local_threat + 3)
 
-            if 200 <= self._tick_count < 500 and nutrients > 50:
+            if 200 <= self._tick_count < 500 and nutrients_now > 50:
                 base = max(base, 7)
 
-            return min(base, nutrients - 2)
+            # 🌋 高资源爆兵阶段
+            if self._tick_count >= 800 and nutrients_now >= 2000:
+                base = max(base, 12)
+
+            return min(base, nutrients_now - 2)
 
         if (self._total_spore_count or 3) <= 3:
             reserve_nutrients = 2
@@ -648,7 +851,7 @@ class Bot:
                 if _in_bounds(nx, ny, width, height):
                     local_threat = max(local_threat, threat_at(Point(nx, ny)))
 
-            desired = calculate_spawner_production(local_threat, len(my_team.spores))
+            desired = calculate_spawner_production(local_threat, len(my_team.spores), nutrients)
 
             if nutrients - desired < reserve_nutrients:
                 continue
@@ -662,11 +865,7 @@ class Bot:
 
         if out_of_time():
             return actions
-
-        # ---------------------------------------------------------
-        # Split - More aggressive
-        # ---------------------------------------------------------
-        # ✅ Survival Guard：存活压力大时不要 split（避免把单位拆弱导致被秒/无法动）
+# ---------- ✂️ Split logic ----------
         if (not survival_mode) and len(my_team.spores) < 18 and time_left() > 0.010:
             split_candidates = sorted(big_spores, key=lambda s: s.biomass, reverse=True)[:3]
 
@@ -721,16 +920,13 @@ class Bot:
         if out_of_time():
             return actions
 
-        # ---------------------------------------------------------
-        # BFS - Adaptive parameters
-        # ---------------------------------------------------------
+        # ---------- 📐 BFS parameters (dynamic based on time) ----------
         def get_bfs_params() -> Dict[str, int]:
             if self._tick_count < 100:
                 return {"depth": 7, "nodes": 250, "spore_limit": 10}
-            elif time_left() > 0.040:
+            if time_left() > 0.040:
                 return {"depth": 6, "nodes": 200, "spore_limit": 8}
-            else:
-                return {"depth": 4, "nodes": 120, "spore_limit": 4}
+            return {"depth": 4, "nodes": 120, "spore_limit": 4}
 
         bfs_params = get_bfs_params()
         BFS_MAX_DEPTH = bfs_params["depth"]
@@ -740,10 +936,18 @@ class Bot:
         def _approx_step_cost(to_pt: Point) -> int:
             if tile_owner(to_pt) == my_team_id and tile_biomass(to_pt) >= 1:
                 return 0
-            elif tile_biomass(to_pt) > 0:
+            if tile_biomass(to_pt) > 0:
                 return 2
-            else:
-                return 1
+            return 1
+
+        # 🎯 获取动态 2-biomass 惩罚
+        penalty_2biomass = self.map_analyzer.calculate_2biomass_penalty(
+            map_type=self._map_type,
+            tick=self._tick_count,
+            my_tile_count=my_tile_count,
+            total_tiles=width * height,
+            spawner_count=len(my_team.spawners)
+        )
 
         def _score_tile_for_spore(
             sp: Spore,
@@ -793,9 +997,9 @@ class Bot:
             if path_cost == 0 and dist > 0:
                 score += (BFS_MAX_DEPTH - dist) * 5
 
-            # ✅ MUST 改：加强 2-biomass 移动惩罚
+            # 🎯 使用动态 2-biomass 惩罚
             if sp.biomass == 2 and _approx_step_cost(pt) == 1:
-                score -= 800
+                score -= penalty_2biomass
 
             if my_biomass_at.get(pt, 0) > 0:
                 score -= 20
@@ -826,7 +1030,15 @@ class Bot:
                     break
 
                 if depth > 0 and first_dir is not None:
-                    s = _score_tile_for_spore(sp, pt, depth, path_cost, is_defender, is_hunter, defend_center)
+                    s = _score_tile_for_spore(
+                        sp,
+                        pt,
+                        depth,
+                        path_cost,
+                        is_defender,
+                        is_hunter,
+                        defend_center,
+                    )
                     if s > best_score:
                         best_score = s
                         best_dir = first_dir
@@ -856,15 +1068,10 @@ class Bot:
 
             return best_dir
 
-        # ---------------------------------------------------------
-        # Move / Fight
-        # ---------------------------------------------------------
+        # ---------- 🚨 Emergency merge ----------
         defend_center: Optional[Point] = spawner_pts[0] if spawner_pts else None
         actionable_sorted = sorted(actionable_spores, key=lambda s: s.biomass, reverse=True)
 
-        # ---------------------------------------------------------
-        # ⭐ Optional：Emergency Merge（锦上添花）
-        # ---------------------------------------------------------
         if actionable_sorted and not out_of_time():
             my_spore_pts: List[Tuple[Point, Spore]] = [(_pos_to_point(s.position), s) for s in my_team.spores]
 
@@ -880,7 +1087,6 @@ class Bot:
                     nd = _manhattan(npt, dst)
                     if nd >= best_dist:
                         continue
-                    # 注意：对不同 biomass 的 spore，我们在外面会再加一层过滤（threat >= biomass 直接拒绝）
                     cost = 0 if (tile_owner(npt) == my_team_id and tile_biomass(npt) >= 1) else 1
                     if cost < best_cost:
                         best_cost = cost
@@ -902,18 +1108,13 @@ class Bot:
                     continue
 
                 src = _pos_to_point(s.position)
-
                 best_buddy: Optional[Point] = None
                 best_key = (10**9, -10**9)
                 for bpt, b in my_spore_pts:
-                    if b.id == s.id:
-                        continue
-                    if b.id in builder_ids:
+                    if b.id == s.id or b.id in builder_ids:
                         continue
                     d = _manhattan(src, bpt)
-                    if d == 0:
-                        continue
-                    if d > 3:
+                    if d == 0 or d > 3:
                         continue
                     key = (d, -b.biomass)
                     if key < best_key:
@@ -937,6 +1138,7 @@ class Bot:
 
                 add_action_for_spore(s.id, SporeMoveAction(sporeId=s.id, direction=step))
 
+        # ---------- 🎯 Main movement logic ----------
         bfs_used = 0
         for sp in actionable_sorted:
             if out_of_time():
@@ -968,11 +1170,9 @@ class Bot:
                 pt = _pos_to_point(sp.position)
                 best_score = -10**18
 
-                # ✅ MUST 改：2-biomass 优先走 0-cost（沿自己轨迹）
-                prefer_zero_cost = (sp.biomass == 2)
+                prefer_zero_cost = sp.biomass == 2
                 passes = (0, 1) if prefer_zero_cost else (1,)
 
-                chosen = False
                 for pass_id in passes:
                     for d in DIRS:
                         nx, ny = pt.x + d.x, pt.y + d.y
@@ -1014,8 +1214,9 @@ class Bot:
                         score -= threat_at(npt) * 45
                         score -= adjacent_enemy_max(npt) * 25
 
+                        # 🎯 使用动态惩罚
                         if sp.biomass == 2 and move_cost == 1:
-                            score -= 900
+                            score -= penalty_2biomass
 
                         if my_biomass_at.get(npt, 0) > 0:
                             score -= 20
@@ -1025,11 +1226,7 @@ class Bot:
                             best_dir = d
 
                     if best_dir is not None:
-                        chosen = True
                         break
-
-                if not chosen:
-                    best_dir = None
 
             if best_dir is not None:
                 add_action_for_spore(sp.id, SporeMoveAction(sporeId=sp.id, direction=best_dir))
@@ -1037,7 +1234,10 @@ class Bot:
                 if is_defender and defend_center is not None:
                     add_action_for_spore(
                         sp.id,
-                        SporeMoveToAction(sporeId=sp.id, position=Position(x=defend_center.x, y=defend_center.y)),
+                        SporeMoveToAction(
+                            sporeId=sp.id,
+                            position=Position(x=defend_center.x, y=defend_center.y),
+                        ),
                     )
                 else:
                     pool = self._top_tiles_cache[:25]
@@ -1060,7 +1260,10 @@ class Bot:
                     if best_t is not None:
                         add_action_for_spore(
                             sp.id,
-                            SporeMoveToAction(sporeId=sp.id, position=Position(x=best_t.x, y=best_t.y)),
+                            SporeMoveToAction(
+                                sporeId=sp.id,
+                                position=Position(x=best_t.x, y=best_t.y),
+                            ),
                         )
 
         return actions
