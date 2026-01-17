@@ -23,6 +23,13 @@ class Bot:
         self.spore_actions_taken: Set[str] = set()
         self.spore_index_map: Dict[str, int] = {}
 
+        # 🔥 鞭子策略变量
+        self.whip_direction = "right"  # 当前鞭子挥动方向
+        self.whip_ticks = 0  # 当前方向已持续的tick数
+        self.whip_duration = 35  # 每个方向持续的tick数
+        self.max_spores = 30  # 最大孢子数
+        self.min_nutrients = 5  # 最小养分阈值
+
     def get_next_move(self, game_message: TeamGameState) -> list[Action]:
         """Advanced strategy combining expansion, economy, and combat."""
         try:
@@ -41,10 +48,21 @@ class Bot:
                 spore.id: idx for idx, spore in enumerate(my_team.spores, start=1)
             }
 
+            # 🔥 更新鞭子方向
+            self.whip_ticks += 1
+            if self.whip_ticks >= self.whip_duration:
+                self.whip_ticks = 0
+                directions = ["right", "down", "left", "up"]
+                current_idx = directions.index(self.whip_direction)
+                self.whip_direction = directions[(current_idx + 1) % 4]
+                print(f"🔥 鞭子转向: {self.whip_direction}")
+
             print(
                 f"Nutrients: {my_team.nutrients}, Spawners: {len(my_team.spawners)}, Spores: {len(my_team.spores)}")
             print(f"Next spawner cost: {my_team.nextSpawnerCost}")
             print(f"Team alive: {my_team.isAlive}")
+            print(
+                f"🔥 鞭子方向: {self.whip_direction} ({self.whip_ticks}/{self.whip_duration})")
             if game_message.tick == 1 and len(my_team.spawners) == 0:
                 print(
                     "❗ Warning: Tick 1 reached without a spawner. This indicates the opening turn failed to create one.")
@@ -205,7 +223,7 @@ class Bot:
         return actions
 
     def _manage_spores(self, my_team: TeamInfo, world: GameWorld, game_message: TeamGameState) -> List[Action]:
-        """Manage all spores - ONE ACTION PER SPORE."""
+        """Manage all spores - 鞭子式移动策略。"""
         actions = []
 
         try:
@@ -216,10 +234,15 @@ class Bot:
             print(
                 f"  Detected {len(enemy_positions)} enemy spores, {len(neutral_positions)} neutral spores")
 
-            print("  Total spores: ", len(my_team.spores))
-            for idx, spore in enumerate(my_team.spores, start=1):
+            # 🔥 按鞭子方向排序孢子
+            sorted_spores = self._sort_spores_for_whip(my_team.spores)
+
+            print("  Total spores: ", len(sorted_spores))
+            for idx, spore in enumerate(sorted_spores, start=1):
                 try:
                     label = f"Spore #{idx}"
+                    is_leader = (idx <= 5)  # 前5个是领头的
+
                     if idx <= 5:
                         print(
                             f"  {label} at ({spore.position.x}, {spore.position.y}), biomass: {spore.biomass}")
@@ -258,23 +281,18 @@ class Bot:
                         self.spore_actions_taken.add(spore.id)
                         continue
 
-                    # Decision 4: Expand
-                    expansion_action = self._expand_territory(
-                        spore, world, my_team, game_message)
-                    if expansion_action:
-                        if hasattr(expansion_action, 'direction'):
-                            direction = expansion_action.direction
-                            if isinstance(expansion_action, SporeSplitAction):
-                                target_tile = (
-                                    spore.position.x + direction.x, spore.position.y + direction.y)
-                                print(
-                                    f"    ↯ {label} splitting: parent stays at ({spore.position.x},{spore.position.y}) while child moves to {target_tile}")
-                            print(
-                                f"    ✓ {label} moving in direction ({direction.x}, {direction.y})")
-                        else:
-                            print(f"    ✓ {label} moving to target position")
-                        actions.append(expansion_action)
+                    # Decision 4: 🔥 鞭子式扩张
+                    whip_move = self._get_whip_move(
+                        spore, world, my_team, is_leader)
+                    if whip_move:
+                        role = "领头" if is_leader else "跟随"
+                        new_x = spore.position.x + whip_move.x
+                        new_y = spore.position.y + whip_move.y
+                        print(f"    🔥 {label} ({role}) -> ({new_x}, {new_y})")
+                        actions.append(SporeMoveAction(
+                            sporeId=spore.id, direction=whip_move))
                         self.spore_actions_taken.add(spore.id)
+                        self.spore_destinations[spore.id] = (new_x, new_y)
                     else:
                         print(f"    ✗ {label} has no valid expansion action")
 
@@ -602,3 +620,104 @@ class Bot:
 
         print(f"      No valid expansion target found")
         return None
+
+    def _sort_spores_for_whip(self, spores: List[Spore]) -> List[Spore]:
+        """按照鞭子方向排序孢子，形成链条。"""
+        if not spores:
+            return []
+
+        # 根据当前鞭子方向排序
+        if self.whip_direction == "right":
+            # 最右边的先动
+            return sorted(spores, key=lambda s: s.position.x, reverse=True)
+        elif self.whip_direction == "down":
+            # 最下方的先动
+            return sorted(spores, key=lambda s: s.position.y, reverse=True)
+        elif self.whip_direction == "left":
+            # 最左边的先动
+            return sorted(spores, key=lambda s: s.position.x)
+        else:  # up
+            # 最上方的先动
+            return sorted(spores, key=lambda s: s.position.y)
+
+    def _get_whip_move(self, spore: Spore, world: GameWorld, my_team: TeamInfo, is_leader: bool) -> Optional[Position]:
+        """获取鞭子式移动方向。"""
+        # 主要方向
+        primary_dir = self._get_whip_primary_direction()
+
+        # 尝试主方向
+        nx = spore.position.x + primary_dir.x
+        ny = spore.position.y + primary_dir.y
+
+        if self._is_valid_move(nx, ny, spore, world, my_team.teamId):
+            return primary_dir
+
+        # 如果主方向不行，尝试侧向扩散
+        side_dirs = self._get_whip_side_directions()
+        random.shuffle(side_dirs)
+
+        for side_dir in side_dirs:
+            nx = spore.position.x + side_dir.x
+            ny = spore.position.y + side_dir.y
+
+            if self._is_valid_move(nx, ny, spore, world, my_team.teamId):
+                return side_dir
+
+        # 最后尝试任意方向
+        all_dirs = [
+            Position(x=0, y=-1), Position(x=0, y=1),
+            Position(x=-1, y=0), Position(x=1, y=0)
+        ]
+        random.shuffle(all_dirs)
+
+        for direction in all_dirs:
+            nx = spore.position.x + direction.x
+            ny = spore.position.y + direction.y
+
+            if self._is_valid_move(nx, ny, spore, world, my_team.teamId):
+                return direction
+
+        return None
+
+    def _get_whip_primary_direction(self) -> Position:
+        """获取鞭子主方向。"""
+        if self.whip_direction == "right":
+            return Position(x=1, y=0)
+        elif self.whip_direction == "down":
+            return Position(x=0, y=1)
+        elif self.whip_direction == "left":
+            return Position(x=-1, y=0)
+        else:  # up
+            return Position(x=0, y=-1)
+
+    def _get_whip_side_directions(self) -> List[Position]:
+        """获取鞭子侧向方向。"""
+        if self.whip_direction in ["right", "left"]:
+            # 水平移动时，侧向是上下
+            return [Position(x=0, y=-1), Position(x=0, y=1)]
+        else:
+            # 垂直移动时，侧向是左右
+            return [Position(x=-1, y=0), Position(x=1, y=0)]
+
+    def _is_valid_move(self, nx: int, ny: int, spore: Spore, world: GameWorld, my_team_id: str) -> bool:
+        """检查移动是否有效。"""
+        # 检查边界
+        if not (0 <= nx < world.map.width and 0 <= ny < world.map.height):
+            return False
+
+        # 检查是否已被占用
+        if (nx, ny) in self.spore_destinations.values():
+            return False
+
+        owner = world.ownershipGrid[ny][nx]
+        biomass = world.biomassGrid[ny][nx]
+
+        # 可以移动到空地或自己的领地
+        if owner == "" or owner == my_team_id:
+            return True
+
+        # 可以攻击较弱的敌人
+        if spore.biomass > biomass + 3:
+            return True
+
+        return False
