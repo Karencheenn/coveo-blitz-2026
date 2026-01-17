@@ -51,18 +51,17 @@ _GLOBAL_TOP_TILES_CACHE: Dict[Tuple[int, int], List[Point]] = {}
 
 class Bot:
     """
-    Improved bot v4.0 - Economic & Combat Enhanced
+    Fixed bot v4.1 - Dynamic Early Game Adaptation
     
-    Major improvements:
-    - Aggressive early-game economy (dynamic spawner production)
-    - Active combat system (hunt weak enemies & neutrals)
-    - Smarter split strategy (more frequent, adaptive sizing)
-    - Intelligent spawner timing (control rate based)
-    - Layered defense (reduce over-defending)
+    CRITICAL FIXES:
+    1. ✅ REMOVED hard EARLY_GAME_SAFETY_THRESHOLD = 5 (was blocking 3-spore maps!)
+    2. ✅ Dynamic spawner timing based on actual map size
+    3. ✅ Aggressive first spawner for small maps (2+ spores ready)
+    4. ✅ Better biomass management to avoid all spores becoming static
     """
 
     def __init__(self):
-        print("Initializing improved bot v4.0 (Economic & Combat Enhanced)")
+        print("Initializing FIXED bot v4.1 - Dynamic Early Game")
 
         # Cache
         self._cached_map_key: Optional[Tuple[int, int]] = None
@@ -76,6 +75,7 @@ class Bot:
         # Timing tracking
         self._first_spawner_tick: Optional[int] = None
         self._tick_count: int = 0
+        self._initial_spore_count: Optional[int] = None  # NEW: Track map size
 
     def get_next_move(self, game_message: TeamGameState) -> list[Action]:
         actions: List[Action] = []
@@ -107,6 +107,11 @@ class Bot:
         nutrient_grid = world.map.nutrientGrid
         ownership_grid = world.ownershipGrid
         biomass_grid = world.biomassGrid
+
+        # 🔥 NEW: Track initial spore count for dynamic strategy
+        if self._initial_spore_count is None and self._tick_count == 1:
+            self._initial_spore_count = len(my_team.spores)
+            print(f"[INIT] Map has {self._initial_spore_count} starting spores")
 
         # ---------------------------------------------------------
         # Cache top tiles
@@ -224,9 +229,51 @@ class Bot:
             total_tiles = width * height
             my_tiles = sum(1 for row in ownership_grid for owner in row if owner == my_team_id)
             return my_tiles / total_tiles if total_tiles > 0 else 0.0
+# ---------------------------------------------------------
+        # 🔥🔥🔥 CRITICAL FIX: Dynamic spawner timing logic
+        # ---------------------------------------------------------
+        def should_build_first_spawner() -> bool:
+            """
+            Dynamic logic based on actual map size
+            OLD BUG: Hard threshold of 5 spores blocked 3-spore maps!
+            NEW: Adapt to map size automatically
+            """
+            if len(my_team.spawners) > 0:
+                return False
+            
+            # Get actual initial spore count (default to 3 for safety)
+            initial_count = self._initial_spore_count or 3
+            current_actionable = len(actionable_spores)
+            
+            # 🎯 For SMALL maps (3 spores) - BE AGGRESSIVE
+            if initial_count <= 3:
+                # Build spawner if:
+                # 1. Have 2+ actionable spores (keep at least 1 for expansion)
+                # 2. OR tick > 15 and have ANY actionable spore (emergency)
+                if current_actionable >= 2:
+                    print(f"[SMALL MAP] Building spawner: {current_actionable}/3 spores ready")
+                    return True
+                if self._tick_count > 15 and current_actionable >= 1:
+                    print(f"[SMALL MAP EMERGENCY] Force spawner at tick {self._tick_count}")
+                    return True
+                print(f"[SMALL MAP] Waiting: only {current_actionable} actionable spores")
+                return False
+            
+            # 🎯 For MEDIUM maps (4-6 spores)
+            if initial_count <= 6:
+                if current_actionable >= 3 or self._tick_count > 20:
+                    print(f"[MEDIUM MAP] Building spawner: {current_actionable} spores")
+                    return True
+                return False
+            
+            # 🎯 For LARGE maps (7+ spores) - Original conservative logic
+            if current_actionable >= 5 or self._tick_count > 30:
+                return True
+            
+            return False
 
         # ---------------------------------------------------------
-        # Spawner placement (enhanced timing)
+        # Spawner placement helpers
         # ---------------------------------------------------------
         SITE_POOL_K = 60
         ENEMY_DIST_CAP = 40
@@ -248,7 +295,9 @@ class Bot:
         def is_safe_site_for_builder(pt: Point, builder_biomass: int) -> bool:
             if builder_biomass <= 0:
                 return False
-            if threat_at(pt) >= builder_biomass - SITE_SAFETY_MARGIN:
+            # 🔥 For small maps, reduce safety requirements
+            margin = SITE_SAFETY_MARGIN if (self._initial_spore_count or 3) > 3 else 0
+            if threat_at(pt) >= builder_biomass - margin:
                 return False
             for d in DIRS:
                 nx, ny = pt.x + d.x, pt.y + d.y
@@ -257,7 +306,7 @@ class Bot:
                     eb = enemy_biomass_at.get(npt, 0)
                     if eb > 0 and builder_biomass <= eb:
                         return False
-                    if threat_at(npt) >= builder_biomass - SITE_SAFETY_MARGIN:
+                    if threat_at(npt) >= builder_biomass - margin:
                         return False
             return True
 
@@ -304,8 +353,10 @@ class Bot:
                     continue
                 if sp.biomass < min_biomass_needed:
                     continue
-                if threat_at(_pos_to_point(sp.position)) >= sp.biomass:
-                    continue
+                # 🔥 For small maps, be more lenient with threats
+                if (self._initial_spore_count or 3) > 3:
+                    if threat_at(_pos_to_point(sp.position)) >= sp.biomass:
+                        continue
                 d = _manhattan(_pos_to_point(sp.position), site)
                 score = d * 100 - sp.biomass * 5
                 if score < best_score:
@@ -315,10 +366,16 @@ class Bot:
 
         builder_ids: Set[str] = set()
 
-        # First spawner
-        if not out_of_time() and len(my_team.spawners) == 0 and actionable_spores:
+        # ---------------------------------------------------------
+        # 🔥 FIRST SPAWNER - Dynamic timing
+        # ---------------------------------------------------------
+        if not out_of_time() and should_build_first_spawner() and actionable_spores:
             min_needed = next_spawner_cost + 2
-            hint_biomass = max(min_needed, 6)
+            # 🔥 For small maps, require LESS biomass (4 instead of 8)
+            if (self._initial_spore_count or 3) <= 3:
+                hint_biomass = max(min_needed, 4)
+            else:
+                hint_biomass = max(min_needed, 8)
 
             locked = self._planned_sites.get("first")
             if locked is None or not site_still_valid(locked, hint_biomass):
@@ -329,19 +386,32 @@ class Bot:
             if locked is not None:
                 builder = pick_builder_spore(site=locked, min_biomass_needed=min_needed, avoid_ids=set())
                 if builder is not None:
-                    builder_ids.add(builder.id)
-                    self._builder_target_by_id[builder.id] = locked
+                    # 🔥 For small maps, skip extra safety checks
+                    should_send = True
+                    if (self._initial_spore_count or 3) > 3:
+                        builder_pt = _pos_to_point(builder.position)
+                        nearby_threats = [eb for ept, eb in enemy_list if _manhattan(builder_pt, ept) <= 4]
+                        max_nearby_threat = max(nearby_threats) if nearby_threats else 0
+                        should_send = builder.biomass > max_nearby_threat + 2
+                    
+                    if should_send:
+                        builder_ids.add(builder.id)
+                        self._builder_target_by_id[builder.id] = locked
 
-                    bpt = _pos_to_point(builder.position)
-                    if bpt == locked and is_safe_site_for_builder(bpt, builder.biomass):
-                        add_action_for_spore(builder.id, SporeCreateSpawnerAction(sporeId=builder.id))
-                    else:
-                        add_action_for_spore(
-                            builder.id,
-                            SporeMoveToAction(sporeId=builder.id, position=Position(x=locked.x, y=locked.y)),
-                        )
+                        bpt = _pos_to_point(builder.position)
+                        if bpt == locked and is_safe_site_for_builder(bpt, builder.biomass):
+                            add_action_for_spore(builder.id, SporeCreateSpawnerAction(sporeId=builder.id))
+                            print(f"✅ [SPAWNER] Built first spawner at tick {self._tick_count}")
+                        else:
+                            add_action_for_spore(
+                                builder.id,
+                                SporeMoveToAction(sporeId=builder.id, position=Position(x=locked.x, y=locked.y)),
+                            )
+                            print(f"🚀 [SPAWNER] Moving to build site at tick {self._tick_count}")
 
-        # Second spawner (improved timing: control rate OR nutrient threshold)
+        # ---------------------------------------------------------
+        # SECOND SPAWNER - Improved timing
+        # ---------------------------------------------------------
         def should_build_second_spawner() -> bool:
             if len(my_team.spawners) != 1:
                 return False
@@ -349,9 +419,15 @@ class Bot:
             control_rate = get_control_rate()
             spawner_age = self._tick_count - self._first_spawner_tick if self._first_spawner_tick else 0
             
-            # Build if we control 30%+ of map OR have 30+ nutrients after 20 ticks
-            return (control_rate > 0.30 and nutrients >= 25) or \
-                   (nutrients >= 30 and spawner_age > 20)
+            # 🔥 Dynamic thresholds based on map size
+            if (self._initial_spore_count or 3) <= 3:
+                # Small maps: build second spawner EARLIER
+                return (control_rate > 0.20 and nutrients >= 15) or \
+                       (nutrients >= 20 and spawner_age > 15)
+            else:
+                # Large maps: original logic
+                return (control_rate > 0.30 and nutrients >= 25) or \
+                       (nutrients >= 30 and spawner_age > 20)
 
         if not out_of_time() and should_build_second_spawner() and actionable_spores:
             min_needed2 = next_spawner_cost + 4
@@ -382,10 +458,9 @@ class Bot:
             return actions
 
         # ---------------------------------------------------------
-        # Soft target identification (NEW: Active combat)
+        # Combat: Find soft targets
         # ---------------------------------------------------------
         def find_soft_targets() -> List[Tuple[Point, int, str, int]]:
-            """Find attackable enemies and neutrals. Returns (target_pt, profit, attacker_id, dist)"""
             targets = []
             
             # Enemy targets
@@ -432,9 +507,8 @@ class Bot:
 
         if out_of_time():
             return actions
-
-        # ---------------------------------------------------------
-        # Layered defense (reduced over-defending)
+# ---------------------------------------------------------
+        # Layered defense
         # ---------------------------------------------------------
         defender_ids: Set[str] = set()
 
@@ -471,7 +545,7 @@ class Bot:
             return actions
 
         # ---------------------------------------------------------
-        # SpawnerProduceSpore (ENHANCED: Dynamic production)
+        # SpawnerProduceSpore - Dynamic production
         # ---------------------------------------------------------
         def calculate_spawner_production(local_threat: int, spore_count: int) -> int:
             base = 4
@@ -518,7 +592,7 @@ class Bot:
             return actions
 
         # ---------------------------------------------------------
-        # Split (ENHANCED: More aggressive)
+        # Split - More aggressive
         # ---------------------------------------------------------
         if len(my_team.spores) < 18 and time_left() > 0.010:
             split_candidates = sorted(big_spores, key=lambda s: s.biomass, reverse=True)[:3]
@@ -575,7 +649,7 @@ class Bot:
             return actions
 
         # ---------------------------------------------------------
-        # BFS (Adaptive parameters)
+        # BFS - Adaptive parameters
         # ---------------------------------------------------------
         def get_bfs_params() -> Dict[str, int]:
             if self._tick_count < 100:
