@@ -50,6 +50,111 @@ _GLOBAL_TOP_TILES_CACHE: Dict[Tuple[int, int], List[Point]] = {}
 
 
 # ============================================================================
+# 🧭 LANE / QUADRANT EXPANSION PLANNER
+# ============================================================================
+class LanePlanner:
+    """大地图扩张：用 4 象限 / 车道 (lane) 锁定目标，避免来回循环。
+
+    设计目标：
+    - 给普通扩张单位一个相对持久的方向目标（锁定 8~15 tick）
+    - 每个象限至少有 1 个扩张者，减少全员抢同一块地造成的堆叠/回撤
+    - 停滞时更激进：锁更远的目标 + 延长锁定时间
+    """
+
+    def __init__(self) -> None:
+        self._lane_targets: Dict[str, Tuple[Point, int]] = {}  # lane -> (target, expiry_tick)
+        self._lane_by_spore_id: Dict[str, Tuple[str, int]] = {}  # sporeId -> (lane, expiry_tick)
+
+    @staticmethod
+    def _lane_of(pt: Point, center: Point) -> str:
+        # NW / NE / SW / SE
+        if pt.y < center.y:
+            return "NW" if pt.x < center.x else "NE"
+        return "SW" if pt.x < center.x else "SE"
+
+    def assign_lane(self, spore_id: str, sp_pt: Point, center: Point, tick: int) -> str:
+        # 维持一段时间，避免每 tick 改 lane 导致抖动
+        cur = self._lane_by_spore_id.get(spore_id)
+        if cur is not None:
+            lane, expiry = cur
+            if tick <= expiry:
+                return lane
+
+        lane = self._lane_of(sp_pt, center)
+        self._lane_by_spore_id[spore_id] = (lane, tick + 25)  # 默认锁 25 tick，后面可被更新
+        return lane
+
+    def pick_lane_targets(
+        self,
+        top_tiles: List[Point],
+        center: Point,
+        width: int,
+        height: int,
+        tick: int,
+        is_stagnant: bool,
+        tile_value_fn,
+        tile_owner_fn,
+        threat_at_fn,
+        my_team_id: int,
+    ) -> Dict[str, Point]:
+        """从 top nutrient tiles 中为每个象限选 1 个目标。
+
+        轻量：只扫描 top_tiles 的前 ~120 个。
+        """
+
+        # 目标锁定时间：停滞时更久，避免摇摆
+        ttl = 18 if is_stagnant else 10
+        scan_k = 140 if is_stagnant else 110
+
+        # 若已有 lane 目标且未过期，就复用
+        out: Dict[str, Point] = {}
+        for lane, (pt, expiry) in list(self._lane_targets.items()):
+            if tick <= expiry:
+                out[lane] = pt
+            else:
+                self._lane_targets.pop(lane, None)
+
+        # 还缺的 lane 重新选
+        need = [l for l in ("NW", "NE", "SW", "SE") if l not in out]
+        if not need:
+            return out
+
+        # 给每个 lane 选一个“远 + 高价值 + 相对安全”的点
+        best: Dict[str, Tuple[int, Point]] = {}
+        for pt in top_tiles[:scan_k]:
+            # 忽略已经是我方领地且很靠近中心的点，避免局部循环
+            if tile_owner_fn(pt) == my_team_id and _manhattan(pt, center) <= 3:
+                continue
+
+            # 若格子威胁太高，直接跳过（硬约束）
+            if threat_at_fn(pt) >= 8:
+                continue
+
+            lane = self._lane_of(pt, center)
+            if lane not in need:
+                continue
+
+            tv = tile_value_fn(pt)
+            dist = _manhattan(pt, center)
+            # 大地图：偏好更远的目标，停滞时远距离更重要
+            score = tv * 6 + dist * (22 if is_stagnant else 14)
+            if tile_owner_fn(pt) != my_team_id:
+                score += 120
+
+            prev = best.get(lane)
+            if prev is None or score > prev[0]:
+                best[lane] = (score, pt)
+
+        for lane in need:
+            if lane in best:
+                pt = best[lane][1]
+                self._lane_targets[lane] = (pt, tick + ttl)
+                out[lane] = pt
+
+        return out
+
+
+# ============================================================================
 # 🗺️ MAP ANALYSIS CLASS
 # ============================================================================
 class ImprovedMapAnalysis:
@@ -107,40 +212,59 @@ class ImprovedMapAnalysis:
         neutral_count: int,
         my_nutrients: int
     ) -> Tuple[bool, int, bool]:
-        """返回: (should_build, min_biomass_needed, is_emergency)"""
+        """返回: (should_build, min_biomass_needed, is_emergency)
+
+        v7 目标：减少“等完美条件”的停滞。
+        - 小图仍谨慎，但不再把 tick/actionable 设成硬门槛
+        - 中/大图尽早启动 spawner，引擎先转起来，再谈完美选址
+        """
+
+        # === 紧迫度（越高越应该立刻建）===
+        # 时间压力
+        urgency = tick
+        # 行动力越少越危险（尤其没 spawner 时）
+        if actionable_count <= 1:
+            urgency += 12
+        elif actionable_count <= 2:
+            urgency += 6
+        # 如果最强 biomass 很大，说明有能力建/推进
+        urgency += max(0, (max_biomass - 4))
+
+        # blocked_small：neutral 堵路时，允许稍晚，但不要无限等
+        if map_type == "blocked_small":
+            urgency -= 4
+            if neutral_count >= 6:
+                urgency -= 3
+
+        # 触发 emergency 的阈值：20 tick 后必须开始放宽
         is_emergency = tick >= 20
-        
-        if map_type == "open_rush":
-            if tick >= 2 and actionable_count >= 1 and max_biomass >= next_spawner_cost:
-                return (True, next_spawner_cost + 1, False)
-        
-        elif map_type == "blocked_small":
-            if neutral_count >= 5:
-                if tick >= 15 and actionable_count >= 2 and max_biomass >= next_spawner_cost + 2:
-                    return (True, max(next_spawner_cost + 2, 4), False)
-                elif tick >= 25 and actionable_count >= 1 and max_biomass >= 3:
-                    return (True, max(next_spawner_cost, 3), True)
-                return (False, 0, False)
-            else:
-                if tick >= 5 and actionable_count >= 1 and max_biomass >= next_spawner_cost + 1:
-                    return (True, next_spawner_cost + 1, False)
-        
-        elif map_type == "medium":
-            if total_spore_count <= 6:
-                if actionable_count >= 2 or tick > 15:
-                    return (True, max(next_spawner_cost + 1, 4), False)
-            else:
-                if actionable_count >= 3 or tick > 20:
-                    return (True, max(next_spawner_cost + 1, 5), False)
-        
-        else:  # large
-            if actionable_count >= 4 or tick > 25:
-                return (True, max(next_spawner_cost + 2, 6), False)
-        
-        if is_emergency and actionable_count >= 1:
-            if max_biomass >= next_spawner_cost + 2:
-                return (True, max(3, next_spawner_cost), True)
-        
+
+        # === 分阶段放宽 ===
+        # 严格：tick<=8
+        # 中等：9-15
+        # 宽松：16-25
+        # 强制：26+
+        if urgency >= 26:
+            # 强制：只要有行动单位，就必须尝试建
+            return (actionable_count >= 1, max(2, next_spawner_cost), True)
+
+        if urgency >= 16:
+            # 宽松：允许 min_needed 接近 cost
+            if actionable_count >= 1 and max_biomass >= max(2, next_spawner_cost):
+                return (True, max(2, next_spawner_cost), is_emergency)
+
+        # 中等：一般期望在 5~12 tick 就能启动
+        if tick >= 3 and actionable_count >= 1 and max_biomass >= next_spawner_cost:
+            # 中/大图更激进：min_needed = cost 或 cost+1
+            if map_type in ("medium", "large"):
+                return (True, max(2, next_spawner_cost), False)
+            # 小图/堵图：略保守一点
+            return (True, max(3, next_spawner_cost + 1), False)
+
+        # 兜底：迟迟不满足时，15 tick 后启动
+        if tick >= 15 and actionable_count >= 1 and max_biomass >= max(2, next_spawner_cost):
+            return (True, max(2, next_spawner_cost), True)
+
         return (False, 0, False)
 
 
@@ -153,6 +277,13 @@ class ExpansionEnhancement:
     def __init__(self):
         self._last_territory_count: int = 0
         self._stagnation_ticks: int = 0
+
+        # 为了避免大地图“局部循环”，我们引入一个更敏感的停滞检测：
+        # - territory 长时间几乎不增长
+        # - 或者扩张速度明显低于期望
+        # 注意：这里仍然保持轻量级，只在 interval 触发。
+        self._last_growth_tick: int = 0
+        self._last_growth_territory: int = 0
     
     def detect_expansion_stagnation(
         self,
@@ -292,21 +423,25 @@ class ExpansionEnhancement:
 # 🤖 MAIN BOT CLASS
 # ============================================================================
 class Bot:
-    """Coveo Blitz Bot v6.0
+    """Coveo Blitz Bot v7.0
     
     主要改进：
     ✅ 智能地图分类
     ✅ 扩张停滞检测
     ✅ 动态 2-biomass 策略
     ✅ 激进生产模式
+    ✅ Lane(象限)扩张：减少大地图局部循环
+    ✅ Progressive Spawner：不再等“完美条件”才建
+    ✅ 轻量缓存：降低每 tick 全图扫描
     """
 
     def __init__(self) -> None:
-        print("🚀 Initializing Bot v6.0 with Expansion Enhancement")
+        print("🚀 Initializing Bot v7.0 (Lane Expansion + Progressive Spawner)")
 
         # 分析系统
         self.map_analyzer = ImprovedMapAnalysis()
         self.expansion_enhancer = ExpansionEnhancement()
+        self.lane_planner = LanePlanner()
         self._map_type: str = ""
 
         # Cache
@@ -323,6 +458,14 @@ class Bot:
         self._tick_count: int = 0
         self._initial_spore_count: Optional[int] = None
         self._total_spore_count: Optional[int] = None
+
+        # 大地图循环检测：记录每只 spore 的最近位置
+        self._pos_hist_by_id: Dict[str, Deque[Point]] = {}
+
+        # 轻量缓存：避免每 tick O(W*H) 全图扫描
+        self._cached_my_tile_count: int = 0
+        self._cached_nutrient_generation: int = 0
+        self._last_full_scan_tick: int = 0
 # ----------------------
     # Helper methods
     # ----------------------
@@ -451,20 +594,24 @@ class Bot:
             )
 
         # ---------- 🌍 Calculate expansion metrics ----------
-        my_tile_count = sum(
-            1
-            for row in ownership_grid
-            for owner in row
-            if owner == my_team_id
-        )
-
-        # 计算 nutrient generation (估算)
-        nutrient_generation = sum(
-            nutrient_grid[y][x]
-            for y in range(height)
-            for x in range(width)
-            if ownership_grid[y][x] == my_team_id
-        )
+        # 性能：全图扫描 O(W*H) 代价不小，尤其大地图。
+        # 我们每 5 tick 才做一次完整扫描，其余 tick 复用缓存。
+        if self._tick_count <= 3 or (self._tick_count - self._last_full_scan_tick) >= 5:
+            my_tile_count = 0
+            nutrient_generation = 0
+            for y in range(height):
+                row_owner = ownership_grid[y]
+                row_nut = nutrient_grid[y]
+                for x in range(width):
+                    if row_owner[x] == my_team_id:
+                        my_tile_count += 1
+                        nutrient_generation += row_nut[x]
+            self._cached_my_tile_count = my_tile_count
+            self._cached_nutrient_generation = nutrient_generation
+            self._last_full_scan_tick = self._tick_count
+        else:
+            my_tile_count = self._cached_my_tile_count
+            nutrient_generation = self._cached_nutrient_generation
 
         # 检测停滞
         is_stagnant = self.expansion_enhancer.detect_expansion_stagnation(
@@ -506,6 +653,23 @@ class Bot:
         def threat_at(pt: Point) -> int:
             return threat_map.get(pt, 0)
 
+        # ---------- 🧭 Lane targets (用于大地图扩张方向锁定) ----------
+        # 注意：我们只在 medium/large 或停滞时启用 lane 目标。
+        lane_targets: Dict[str, Point] = {}
+        if self._map_type in ("medium", "large") or is_stagnant:
+            lane_targets = self.lane_planner.pick_lane_targets(
+                top_tiles=self._top_tiles_cache,
+                center=my_center,
+                width=width,
+                height=height,
+                tick=self._tick_count,
+                is_stagnant=is_stagnant,
+                tile_value_fn=tile_value,
+                tile_owner_fn=tile_owner,
+                threat_at_fn=threat_at,
+                my_team_id=my_team_id,
+            )
+
         # ---------- 🎯 Calculate dynamic 2-biomass penalty ----------
         penalty_2biomass = self.expansion_enhancer.improved_2biomass_penalty(
             map_type=self._map_type,
@@ -536,6 +700,22 @@ class Bot:
         # ---------- Partition units ----------
         actionable_spores: List[Spore] = [s for s in my_team.spores if s.biomass >= 2]
         big_spores: List[Spore] = [s for s in my_team.spores if s.biomass >= 6]
+
+        # ---------- 🔁 循环检测：更新位置历史 ----------
+        # 目的：大地图常见问题是“左右来回抖动”。我们记录最近 4 个位置，用于惩罚回头路。
+        live_ids: Set[str] = set()
+        for s in my_team.spores:
+            live_ids.add(s.id)
+            pt = _pos_to_point(s.position)
+            dq = self._pos_hist_by_id.get(s.id)
+            if dq is None:
+                dq = deque(maxlen=4)
+            dq.append(pt)
+            self._pos_hist_by_id[s.id] = dq
+        # 清理已死亡的 spores
+        for sid in list(self._pos_hist_by_id.keys()):
+            if sid not in live_ids:
+                self._pos_hist_by_id.pop(sid, None)
 
         total_spores_now = len(my_team.spores)
         survival_mode = (
@@ -589,9 +769,14 @@ class Bot:
             if threat_at(pt) >= builder_biomass - margin:
                 return False
 
-            if not lenient:
-                density = self.enemy_density_in_radius(pt, enemy_biomass_at, radius=5)
-                if density >= 6:
+            # 大地图不要把“敌人密度”当作硬过滤，否则很容易找不到点而停滞。
+            # 仅在小/中图且敌人较多时启用，并且阈值随 tick 放宽。
+            if not lenient and self._map_type in ("open_rush", "blocked_small", "medium") and len(enemy_biomass_at) >= 6:
+                radius = 5 if self._map_type != "blocked_small" else 4
+                density = self.enemy_density_in_radius(pt, enemy_biomass_at, radius=radius)
+                # 越往后越宽松（允许更高密度）
+                dens_th = 6 if self._tick_count <= 12 else (8 if self._tick_count <= 20 else 10)
+                if density >= dens_th:
                     return False
 
             if lenient:
@@ -776,9 +961,15 @@ class Bot:
             control_rate = get_control_rate()
             spawner_age = self._tick_count - self._first_spawner_tick if self._first_spawner_tick else 0
 
+            # v7：大地图要更早开始第二个 spawner，不然很容易“守着一块地不出门”。
+            if self._map_type == "large":
+                return (control_rate > 0.12 and nutrients >= 15) or (nutrients >= 20 and spawner_age > 12) or (spawner_age > 25)
+
             if (self._total_spore_count or 3) <= 3:
                 return (control_rate > 0.15 and nutrients >= 10) or (nutrients >= 15 and spawner_age > 10)
-            return (control_rate > 0.25 and nutrients >= 20) or (nutrients >= 25 and spawner_age > 15)
+
+            # medium / small
+            return (control_rate > 0.22 and nutrients >= 18) or (nutrients >= 25 and spawner_age > 15)
 
         if not out_of_time() and should_build_second_spawner() and actionable_spores:
             min_needed2 = next_spawner_cost + 2
@@ -1029,12 +1220,16 @@ class Bot:
         # ---------- 🎯 IMPROVED SCORING FUNCTION ----------
         def _score_tile_for_spore(
             sp: Spore,
+            start_pt: Point,
             pt: Point,
             dist: int,
             path_cost: int,
             is_defender: bool,
             is_hunter: bool,
             defend_center: Optional[Point],
+            lane_target: Optional[Point],
+            prev_pt: Optional[Point],
+            pioneer_2_cost_penalty: int,
         ) -> int:
             tv = tile_value(pt)
             owner = tile_owner(pt)
@@ -1083,6 +1278,22 @@ class Bot:
                 )
                 score += expansion_bonus
 
+                # 🧭 Lane 方向奖励：让单位持续朝“象限目标”推进，避免大地图原地兜圈
+                if lane_target is not None:
+                    # 越靠近目标越好；停滞时放大系数
+                    base = 18 if not is_stagnant else 26
+                    d0 = _manhattan(start_pt, lane_target)
+                    d1 = _manhattan(pt, lane_target)
+                    score += (d0 - d1) * base
+
+                    # 鼓励“向外走”，不要一直围绕中心打转
+                    outward = _manhattan(pt, my_center) - _manhattan(start_pt, my_center)
+                    score += outward * (12 if not is_stagnant else 18)
+
+                # 在中/大图：过于靠近中心的自家地块给一点惩罚，减少局部循环
+                if self._map_type in ("medium", "large") and owner == my_team_id and _manhattan(pt, my_center) <= 3:
+                    score -= 90
+
             # 📏 距离惩罚（降低）
             score -= dist * 18  # 从 25 降低
             score -= path_cost * 25  # 从 35 降低
@@ -1093,7 +1304,13 @@ class Bot:
 
             # 🎯 2-biomass 惩罚（使用动态版本）
             if sp.biomass == 2 and _approx_step_cost(pt) == 1:
-                score -= penalty_2biomass
+                score -= pioneer_2_cost_penalty
+
+            # 🔁 回头路惩罚：若候选点是“上一个位置”，通常表示在抖动
+            # 但如果当前位置有威胁（需要撤退/换位），就不要强压。
+            if prev_pt is not None and pt == prev_pt:
+                if threat_at(start_pt) == 0 and adjacent_enemy_max(start_pt) == 0:
+                    score -= 220
 
             if my_biomass_at.get(pt, 0) > 0:
                 score -= 20
@@ -1105,6 +1322,9 @@ class Bot:
             is_defender: bool,
             is_hunter: bool,
             defend_center: Optional[Point],
+            lane_target: Optional[Point],
+            prev_pt: Optional[Point],
+            pioneer_2_cost_penalty: int,
         ) -> Optional[Position]:
             start = _pos_to_point(sp.position)
             q: Deque[Tuple[Point, int, Optional[Position], int]] = deque()
@@ -1126,12 +1346,16 @@ class Bot:
                 if depth > 0 and first_dir is not None:
                     s = _score_tile_for_spore(
                         sp,
+                        start,
                         pt,
                         depth,
                         path_cost,
                         is_defender,
                         is_hunter,
                         defend_center,
+                        lane_target,
+                        prev_pt,
+                        pioneer_2_cost_penalty,
                     )
                     if s > best_score:
                         best_score = s
@@ -1242,9 +1466,38 @@ class Bot:
             is_defender = sp.id in defender_ids
             is_hunter = sp.id in hunter_ids
 
+            sp_pt = _pos_to_point(sp.position)
+
+            # lane / 方向锁定（仅普通扩张单位）
+            lane_target: Optional[Point] = None
+            if not is_defender and not is_hunter and (self._map_type in ("medium", "large") or is_stagnant):
+                lane = self.lane_planner.assign_lane(sp.id, sp_pt, my_center, self._tick_count)
+                lane_target = lane_targets.get(lane)
+
+            # 上一格（用于防抖）
+            hist = self._pos_hist_by_id.get(sp.id)
+            prev_pt: Optional[Point] = None
+            if hist is not None and len(hist) >= 2:
+                prev_pt = hist[-2]
+
+            # Pioneer：允许 2 biomass 在大地图“牺牲一次行动”去拉开距离（但要有安全余量）
+            is_pioneer = False
+            pioneer_2_cost_penalty = penalty_2biomass
+            if (
+                sp.biomass == 2
+                and lane_target is not None
+                and not survival_mode
+                and not is_defender
+                and not is_hunter
+                and (len(my_team.spawners) >= 1 or len(actionable_spores) >= 3)
+                and _manhattan(sp_pt, lane_target) >= 5
+            ):
+                is_pioneer = True
+                pioneer_2_cost_penalty = max(20, penalty_2biomass // 3)
+
             if is_defender and defend_center is not None:
-                if _manhattan(_pos_to_point(sp.position), defend_center) <= 2:
-                    cur_pt = _pos_to_point(sp.position)
+                if _manhattan(sp_pt, defend_center) <= 2:
+                    cur_pt = sp_pt
                     if threat_at(cur_pt) == 0 and adjacent_enemy_max(cur_pt) == 0:
                         continue
 
@@ -1257,15 +1510,19 @@ class Bot:
                     is_defender=is_defender,
                     is_hunter=is_hunter,
                     defend_center=defend_center,
+                    lane_target=lane_target,
+                    prev_pt=prev_pt,
+                    pioneer_2_cost_penalty=pioneer_2_cost_penalty,
                 )
                 bfs_used += 1
 
             # 如果 BFS 没找到方向，使用贪心搜索
             if best_dir is None:
-                pt = _pos_to_point(sp.position)
+                pt = sp_pt
                 best_score = -10**18
 
-                prefer_zero_cost = sp.biomass == 2
+                # 非 pioneer 的 2 biomass 尽量走 0-cost；pioneer 允许走 1-cost
+                prefer_zero_cost = (sp.biomass == 2 and not is_pioneer)
                 passes = (0, 1) if prefer_zero_cost else (1,)
 
                 for pass_id in passes:
@@ -1314,6 +1571,18 @@ class Bot:
                             )
                             score += expansion_bonus
 
+                            # 🧭 Lane 方向奖励：持续往象限目标推进
+                            if lane_target is not None:
+                                base = 18 if not is_stagnant else 26
+                                d0 = _manhattan(pt, lane_target)
+                                d1 = _manhattan(npt, lane_target)
+                                score += (d0 - d1) * base
+                                outward = _manhattan(npt, my_center) - _manhattan(pt, my_center)
+                                score += outward * (12 if not is_stagnant else 18)
+
+                            if self._map_type in ("medium", "large") and tile_owner(npt) == my_team_id and _manhattan(npt, my_center) <= 3:
+                                score -= 90
+
                         if move_cost == 0:
                             score += 15
 
@@ -1324,9 +1593,14 @@ class Bot:
                         score -= threat_at(npt) * 30  # 从 45 降低
                         score -= adjacent_enemy_max(npt) * 20  # 从 25 降低
 
-                        # 🎯 动态 2-biomass 惩罚
+                        # 🎯 动态 2-biomass 惩罚（pioneer 会更宽松）
                         if sp.biomass == 2 and move_cost == 1:
-                            score -= penalty_2biomass
+                            score -= pioneer_2_cost_penalty
+
+                        # 🔁 回头路惩罚（防抖）
+                        if prev_pt is not None and npt == prev_pt:
+                            if threat_at(pt) == 0 and adjacent_enemy_max(pt) == 0:
+                                score -= 220
 
                         if my_biomass_at.get(npt, 0) > 0:
                             score -= 20
@@ -1352,9 +1626,20 @@ class Bot:
                         ),
                     )
                 else:
-                    # 寻找最近的高价值地块
-                    pool = self._top_tiles_cache[:25]
+                    # 优先：lane 目标（大地图避免“兜圈”）
                     sp_pt = _pos_to_point(sp.position)
+                    if lane_target is not None and threat_at(lane_target) < sp.biomass:
+                        add_action_for_spore(
+                            sp.id,
+                            SporeMoveToAction(
+                                sporeId=sp.id,
+                                position=Position(x=lane_target.x, y=lane_target.y),
+                            ),
+                        )
+                        continue
+
+                    # 次优：寻找最近的高价值地块
+                    pool = self._top_tiles_cache[:25]
                     best_t: Optional[Point] = None
                     best_s = 10**18
 
