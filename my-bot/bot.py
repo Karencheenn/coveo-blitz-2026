@@ -45,39 +45,45 @@ def _manhattan(a: Point, b: Point) -> int:
     return abs(a.x - b.x) + abs(a.y - b.y)
 
 
-# If Bot instance is recreated often, this global cache still helps.
+# Global cache for top nutrient tiles
 _GLOBAL_TOP_TILES_CACHE: Dict[Tuple[int, int], List[Point]] = {}
 
 
 class Bot:
     """
-    Improved bot v3.2 (anti-timeout)
-    - Hard tick time budget gate (avoid websocket disconnects due to >100ms tick)
-    - Cached top nutrient tiles
-    - Locked spawner sites + builder targets
-    - Relative safety for spawner site (builder can survive/win)
-    - BFS throttled by time remaining + reduced parameters
+    Improved bot v4.0 - Economic & Combat Enhanced
+    
+    Major improvements:
+    - Aggressive early-game economy (dynamic spawner production)
+    - Active combat system (hunt weak enemies & neutrals)
+    - Smarter split strategy (more frequent, adaptive sizing)
+    - Intelligent spawner timing (control rate based)
+    - Layered defense (reduce over-defending)
     """
 
     def __init__(self):
-        print("Initializing improved bot v3.2 (anti-timeout)")
+        print("Initializing improved bot v4.0 (Economic & Combat Enhanced)")
 
-        # local cache pointers
+        # Cache
         self._cached_map_key: Optional[Tuple[int, int]] = None
-        self._top_tiles_cache: List[Point] = []  # points sorted by nutrient desc
+        self._top_tiles_cache: List[Point] = []
         self._top_tiles_k: int = 400
 
-        # lock targets
-        self._planned_sites: Dict[str, Point] = {}          # {"first": pt, "second": pt}
-        self._builder_target_by_id: Dict[str, Point] = {}   # spore_id -> site
+        # Spawner planning
+        self._planned_sites: Dict[str, Point] = {}
+        self._builder_target_by_id: Dict[str, Point] = {}
+        
+        # Timing tracking
+        self._first_spawner_tick: Optional[int] = None
+        self._tick_count: int = 0
 
     def get_next_move(self, game_message: TeamGameState) -> list[Action]:
         actions: List[Action] = []
+        self._tick_count = game_message.tick
 
         # =========================
-        # Tick time budget gate
+        # Tick time budget
         # =========================
-        # Engine budget is ~100ms/tick; keep margin.
         TICK_BUDGET_SEC = 0.085
         tick_start = time.perf_counter()
 
@@ -87,7 +93,6 @@ class Bot:
         def out_of_time() -> bool:
             return time_left() <= 0.0
 
-        # Debug invalid actions from previous tick.
         if game_message.lastTickErrors:
             print("lastTickErrors:", game_message.lastTickErrors)
 
@@ -104,18 +109,16 @@ class Bot:
         biomass_grid = world.biomassGrid
 
         # ---------------------------------------------------------
-        # 0) Cache: top nutrient tiles (sort once)
+        # Cache top tiles
         # ---------------------------------------------------------
         def _ensure_top_tiles_cache() -> None:
             key = (width, height)
 
-            # Global cache
             if key in _GLOBAL_TOP_TILES_CACHE and _GLOBAL_TOP_TILES_CACHE[key]:
                 self._cached_map_key = key
                 self._top_tiles_cache = _GLOBAL_TOP_TILES_CACHE[key]
                 return
 
-            # Local cache
             if self._cached_map_key == key and self._top_tiles_cache:
                 _GLOBAL_TOP_TILES_CACHE[key] = self._top_tiles_cache
                 return
@@ -140,16 +143,18 @@ class Bot:
             return biomass_grid[pt.y][pt.x]
 
         # ---------------------------------------------------------
-        # 1) Quick indexing: enemy / mine
+        # Index units
         # ---------------------------------------------------------
         enemy_biomass_at: Dict[Point, int] = {}
         my_biomass_at: Dict[Point, int] = {}
+        neutral_spores: List[Tuple[Point, int]] = []
 
-        # This loop is typically not the bottleneck; keep it simple.
         for sp in world.spores:
             pt = _pos_to_point(sp.position)
             if sp.teamId == my_team_id:
                 my_biomass_at[pt] = max(my_biomass_at.get(pt, 0), sp.biomass)
+            elif sp.teamId == 0:
+                neutral_spores.append((pt, sp.biomass))
             else:
                 enemy_biomass_at[pt] = max(enemy_biomass_at.get(pt, 0), sp.biomass)
 
@@ -160,35 +165,31 @@ class Bot:
             m = 0
             for d in DIRS:
                 nx, ny = pt.x + d.x, pt.y + d.y
-                if not _in_bounds(nx, ny, width, height):
-                    continue
-                m = max(m, enemy_biomass_at.get(Point(nx, ny), 0))
+                if _in_bounds(nx, ny, width, height):
+                    m = max(m, enemy_biomass_at.get(Point(nx, ny), 0))
             return m
 
         # ---------------------------------------------------------
-        # 2) Threat map: enemy cell + 4-neighbors (max biomass)
+        # Threat map
         # ---------------------------------------------------------
         threat_map: Dict[Point, int] = {}
         for ept, eb in enemy_biomass_at.items():
-            # enemy's own tile
             prev = threat_map.get(ept, 0)
             if eb > prev:
                 threat_map[ept] = eb
-            # neighbors
             for d in DIRS:
                 nx, ny = ept.x + d.x, ept.y + d.y
-                if not _in_bounds(nx, ny, width, height):
-                    continue
-                npt = Point(nx, ny)
-                prev2 = threat_map.get(npt, 0)
-                if eb > prev2:
-                    threat_map[npt] = eb
+                if _in_bounds(nx, ny, width, height):
+                    npt = Point(nx, ny)
+                    prev2 = threat_map.get(npt, 0)
+                    if eb > prev2:
+                        threat_map[npt] = eb
 
         def threat_at(pt: Point) -> int:
             return threat_map.get(pt, 0)
 
         # ---------------------------------------------------------
-        # 3) One unit one action
+        # One action per unit
         # ---------------------------------------------------------
         used_spores: Set[str] = set()
         used_spawners: Set[str] = set()
@@ -206,14 +207,26 @@ class Bot:
             actions.append(action)
 
         # ---------------------------------------------------------
-        # 4) Partition
+        # Partition units
         # ---------------------------------------------------------
         actionable_spores: List[Spore] = [s for s in my_team.spores if s.biomass >= 2]
-        big_spores: List[Spore] = [s for s in my_team.spores if s.biomass >= 5]
+        big_spores: List[Spore] = [s for s in my_team.spores if s.biomass >= 6]
         spawner_pts: List[Point] = [_pos_to_point(s.position) for s in my_team.spawners]
 
+        # Track first spawner timing
+        if len(my_team.spawners) > 0 and self._first_spawner_tick is None:
+            self._first_spawner_tick = self._tick_count
+
         # ---------------------------------------------------------
-        # 5) Spawner placement (locked + relative safe)
+        # Helper: Calculate map control rate
+        # ---------------------------------------------------------
+        def get_control_rate() -> float:
+            total_tiles = width * height
+            my_tiles = sum(1 for row in ownership_grid for owner in row if owner == my_team_id)
+            return my_tiles / total_tiles if total_tiles > 0 else 0.0
+
+        # ---------------------------------------------------------
+        # Spawner placement (enhanced timing)
         # ---------------------------------------------------------
         SITE_POOL_K = 60
         ENEMY_DIST_CAP = 40
@@ -235,22 +248,17 @@ class Bot:
         def is_safe_site_for_builder(pt: Point, builder_biomass: int) -> bool:
             if builder_biomass <= 0:
                 return False
-
             if threat_at(pt) >= builder_biomass - SITE_SAFETY_MARGIN:
                 return False
-
-            # Adjacent enemy must be beatable; adjacent threat must be tolerable
             for d in DIRS:
                 nx, ny = pt.x + d.x, pt.y + d.y
-                if not _in_bounds(nx, ny, width, height):
-                    continue
-                npt = Point(nx, ny)
-                eb = enemy_biomass_at.get(npt, 0)
-                if eb > 0 and builder_biomass <= eb:
-                    return False
-                if threat_at(npt) >= builder_biomass - SITE_SAFETY_MARGIN:
-                    return False
-
+                if _in_bounds(nx, ny, width, height):
+                    npt = Point(nx, ny)
+                    eb = enemy_biomass_at.get(npt, 0)
+                    if eb > 0 and builder_biomass <= eb:
+                        return False
+                    if threat_at(npt) >= builder_biomass - SITE_SAFETY_MARGIN:
+                        return False
             return True
 
         def site_still_valid(site: Point, builder_biomass: int) -> bool:
@@ -296,7 +304,6 @@ class Bot:
                     continue
                 if sp.biomass < min_biomass_needed:
                     continue
-                # avoid starting in losing-threat zone
                 if threat_at(_pos_to_point(sp.position)) >= sp.biomass:
                     continue
                 d = _manhattan(_pos_to_point(sp.position), site)
@@ -308,7 +315,7 @@ class Bot:
 
         builder_ids: Set[str] = set()
 
-        # --- First spawner ---
+        # First spawner
         if not out_of_time() and len(my_team.spawners) == 0 and actionable_spores:
             min_needed = next_spawner_cost + 2
             hint_biomass = max(min_needed, 6)
@@ -334,8 +341,19 @@ class Bot:
                             SporeMoveToAction(sporeId=builder.id, position=Position(x=locked.x, y=locked.y)),
                         )
 
-        # --- Second spawner ---
-        if not out_of_time() and len(my_team.spawners) == 1 and nutrients >= 45 and actionable_spores:
+        # Second spawner (improved timing: control rate OR nutrient threshold)
+        def should_build_second_spawner() -> bool:
+            if len(my_team.spawners) != 1:
+                return False
+            
+            control_rate = get_control_rate()
+            spawner_age = self._tick_count - self._first_spawner_tick if self._first_spawner_tick else 0
+            
+            # Build if we control 30%+ of map OR have 30+ nutrients after 20 ticks
+            return (control_rate > 0.30 and nutrients >= 25) or \
+                   (nutrients >= 30 and spawner_age > 20)
+
+        if not out_of_time() and should_build_second_spawner() and actionable_spores:
             min_needed2 = next_spawner_cost + 4
             hint_biomass2 = max(min_needed2, 8)
 
@@ -361,66 +379,115 @@ class Bot:
                         )
 
         if out_of_time():
-            # Safety return: never exceed time budget
             return actions
 
         # ---------------------------------------------------------
-        # 6) Defender assignment (avoid builders)
+        # Soft target identification (NEW: Active combat)
         # ---------------------------------------------------------
-        defender_ids: Set[str] = set()
-        spawner_pts = [_pos_to_point(s.position) for s in my_team.spawners]
+        def find_soft_targets() -> List[Tuple[Point, int, str, int]]:
+            """Find attackable enemies and neutrals. Returns (target_pt, profit, attacker_id, dist)"""
+            targets = []
+            
+            # Enemy targets
+            for enemy_pt, enemy_bio in enemy_list:
+                attackers = [s for s in actionable_spores 
+                           if s.id not in builder_ids 
+                           and s.id not in used_spores
+                           and s.biomass > enemy_bio + 1]
+                if attackers:
+                    nearest = min(attackers, key=lambda s: _manhattan(_pos_to_point(s.position), enemy_pt))
+                    dist = _manhattan(_pos_to_point(nearest.position), enemy_pt)
+                    if dist <= 10:
+                        profit = tile_value(enemy_pt) + enemy_bio
+                        targets.append((enemy_pt, profit, nearest.id, dist))
+            
+            # Neutral targets
+            for neutral_pt, neutral_bio in neutral_spores:
+                attackers = [s for s in actionable_spores 
+                           if s.id not in builder_ids 
+                           and s.id not in used_spores
+                           and s.biomass > neutral_bio]
+                if attackers:
+                    nearest = min(attackers, key=lambda s: _manhattan(_pos_to_point(s.position), neutral_pt))
+                    dist = _manhattan(_pos_to_point(nearest.position), neutral_pt)
+                    if dist <= 8:
+                        profit = tile_value(neutral_pt) + neutral_bio // 2
+                        targets.append((neutral_pt, profit, nearest.id, dist))
+            
+            targets.sort(key=lambda t: t[1] / (t[3] + 1), reverse=True)
+            return targets[:5]
 
-        if spawner_pts and actionable_spores:
-            need_defense = False
-            for spt in spawner_pts:
-                if threat_at(spt) > 0 or adjacent_enemy_max(spt) > 0:
-                    need_defense = True
-                    break
-                for d in DIRS:
-                    nx, ny = spt.x + d.x, spt.y + d.y
-                    if _in_bounds(nx, ny, width, height) and threat_at(Point(nx, ny)) > 0:
-                        need_defense = True
-                        break
-                if need_defense:
-                    break
-
-            if need_defense:
-                remaining = [s for s in actionable_spores if s.id not in builder_ids and s.id not in used_spores]
-                remaining.sort(key=lambda s: s.biomass, reverse=True)
-
-                def pick_nearest_defender(target_pt: Point, exclude: Set[str]) -> Optional[Spore]:
-                    best_s: Optional[Spore] = None
-                    best_d = 10**9
-                    for sp in remaining:
-                        if sp.id in exclude:
-                            continue
-                        d = _manhattan(_pos_to_point(sp.position), target_pt)
-                        if d < best_d:
-                            best_d = d
-                            best_s = sp
-                    return best_s
-
-                assigned: Set[str] = set()
-                for spt in spawner_pts:
-                    if out_of_time():
-                        break
-                    sp1 = pick_nearest_defender(spt, assigned)
-                    if sp1 is not None:
-                        assigned.add(sp1.id)
-                        defender_ids.add(sp1.id)
-                    if len(actionable_spores) >= 6:
-                        sp2 = pick_nearest_defender(spt, assigned)
-                        if sp2 is not None:
-                            assigned.add(sp2.id)
-                            defender_ids.add(sp2.id)
+        hunter_ids: Set[str] = set()
+        soft_targets = find_soft_targets()
+        
+        for target_pt, profit, attacker_id, dist in soft_targets:
+            if out_of_time():
+                break
+            if attacker_id not in used_spores and profit > 20:
+                hunter_ids.add(attacker_id)
+                add_action_for_spore(
+                    attacker_id,
+                    SporeMoveToAction(sporeId=attacker_id, position=Position(x=target_pt.x, y=target_pt.y))
+                )
 
         if out_of_time():
             return actions
 
         # ---------------------------------------------------------
-        # 7) SpawnerProduceSpore (time-safe)
+        # Layered defense (reduced over-defending)
         # ---------------------------------------------------------
-        reserve_nutrients = 10 if len(my_team.spawners) == 1 else 0
+        defender_ids: Set[str] = set()
+
+        if spawner_pts and actionable_spores:
+            for spt in spawner_pts:
+                if out_of_time():
+                    break
+                
+                direct_threat = threat_at(spt)
+                adjacent_threat = adjacent_enemy_max(spt)
+                
+                if direct_threat > 0:
+                    remaining = [s for s in actionable_spores 
+                               if s.id not in builder_ids 
+                               and s.id not in hunter_ids
+                               and s.id not in used_spores
+                               and s.biomass >= direct_threat + 2]
+                    if remaining:
+                        defender = min(remaining, key=lambda s: _manhattan(_pos_to_point(s.position), spt))
+                        defender_ids.add(defender.id)
+                
+                elif adjacent_threat > 0:
+                    remaining = [s for s in actionable_spores 
+                               if s.id not in builder_ids 
+                               and s.id not in hunter_ids
+                               and s.id not in defender_ids
+                               and s.id not in used_spores
+                               and s.biomass >= 4]
+                    if remaining and len(defender_ids) < len(spawner_pts):
+                        defender = min(remaining, key=lambda s: _manhattan(_pos_to_point(s.position), spt))
+                        defender_ids.add(defender.id)
+
+        if out_of_time():
+            return actions
+
+        # ---------------------------------------------------------
+        # SpawnerProduceSpore (ENHANCED: Dynamic production)
+        # ---------------------------------------------------------
+        def calculate_spawner_production(local_threat: int, spore_count: int) -> int:
+            base = 4
+            
+            if self._tick_count < 200 and spore_count < 15:
+                base = max(5, nutrients // 10)
+            
+            if local_threat > 0:
+                base = max(base, local_threat + 3)
+            
+            if 200 <= self._tick_count < 500 and nutrients > 50:
+                base = max(base, 6)
+            
+            return min(base, nutrients - 3)
+
+        reserve_nutrients = 3 if len(my_team.spawners) >= 2 else 5
 
         for spawner in my_team.spawners:
             if out_of_time():
@@ -435,19 +502,12 @@ class Bot:
                 if _in_bounds(nx, ny, width, height):
                     local_threat = max(local_threat, threat_at(Point(nx, ny)))
 
-            desired = 3 if len(my_team.spores) < 5 else 2
-
-            # If threatened, produce strictly bigger than threat to avoid "free food"
-            if local_threat > 0:
-                desired = max(desired, local_threat + 1)
-
-            if nutrients >= 14 and len(my_team.spores) < 10 and local_threat == 0:
-                desired = max(desired, 3)
+            desired = calculate_spawner_production(local_threat, len(my_team.spores))
 
             if nutrients - desired < reserve_nutrients:
                 continue
 
-            if nutrients >= desired:
+            if nutrients >= desired and desired >= 2:
                 add_action_for_spawner(
                     spawner.id,
                     SpawnerProduceSporeAction(spawnerId=spawner.id, biomass=desired),
@@ -458,10 +518,12 @@ class Bot:
             return actions
 
         # ---------------------------------------------------------
-        # 8) Split (guarded by time)
+        # Split (ENHANCED: More aggressive)
         # ---------------------------------------------------------
-        if len(my_team.spores) < 6 and time_left() > 0.010:
-            for sp in sorted(big_spores, key=lambda s: s.biomass, reverse=True):
+        if len(my_team.spores) < 18 and time_left() > 0.010:
+            split_candidates = sorted(big_spores, key=lambda s: s.biomass, reverse=True)[:3]
+            
+            for sp in split_candidates:
                 if out_of_time():
                     break
                 if sp.id in used_spores or sp.id in builder_ids:
@@ -496,9 +558,9 @@ class Bot:
                         best_score = score
                         best_dir = d
 
-                if best_dir is not None and best_score >= 45:
-                    moving_biomass = 3
-                    if 1 <= moving_biomass < sp.biomass:
+                if best_dir is not None and best_score >= 35:
+                    moving_biomass = sp.biomass // 2
+                    if 2 <= moving_biomass < sp.biomass:
                         add_action_for_spore(
                             sp.id,
                             SporeSplitAction(
@@ -513,19 +575,31 @@ class Bot:
             return actions
 
         # ---------------------------------------------------------
-        # 9) Limited BFS (throttled by time remaining)
+        # BFS (Adaptive parameters)
         # ---------------------------------------------------------
-        BFS_MAX_DEPTH = 5
-        BFS_MAX_NODES = 160
-        BFS_SPORE_LIMIT = 6
+        def get_bfs_params() -> Dict[str, int]:
+            if self._tick_count < 100:
+                return {"depth": 7, "nodes": 250, "spore_limit": 10}
+            elif time_left() > 0.040:
+                return {"depth": 6, "nodes": 200, "spore_limit": 8}
+            else:
+                return {"depth": 4, "nodes": 120, "spore_limit": 4}
+
+        bfs_params = get_bfs_params()
+        BFS_MAX_DEPTH = bfs_params["depth"]
+        BFS_MAX_NODES = bfs_params["nodes"]
+        BFS_SPORE_LIMIT = bfs_params["spore_limit"]
 
         def _approx_step_cost(to_pt: Point) -> int:
-            # Move cost approximation: on our trail => 0 else 1
             if tile_owner(to_pt) == my_team_id and tile_biomass(to_pt) >= 1:
                 return 0
-            return 1
+            elif tile_biomass(to_pt) > 0:
+                return 2
+            else:
+                return 1
 
-        def _score_tile_for_spore(sp: Spore, pt: Point, dist: int, path_cost: int, is_defender: bool, defend_center: Optional[Point]) -> int:
+        def _score_tile_for_spore(sp: Spore, pt: Point, dist: int, path_cost: int, 
+                                  is_defender: bool, is_hunter: bool, defend_center: Optional[Point]) -> int:
             tv = tile_value(pt)
             owner = tile_owner(pt)
             tb = tile_biomass(pt)
@@ -546,18 +620,24 @@ class Bot:
             score -= thr * 45
             score -= adjacent_enemy_max(pt) * 25
 
-            if not is_defender:
-                score += tv * 2
-                if owner != my_team_id:
-                    score += 70
-            else:
+            if is_hunter:
+                if enemy_here > 0:
+                    score += 300
+                score += tv
+            elif is_defender and defend_center is not None:
                 score += (30 if owner == my_team_id else 0)
                 score += tv // 2
-                if defend_center is not None:
-                    score -= _manhattan(pt, defend_center) * 35
+                score -= _manhattan(pt, defend_center) * 35
+            else:
+                score += tv * 3
+                if owner != my_team_id:
+                    score += 80
 
             score -= dist * 25
             score -= path_cost * 35
+
+            if path_cost == 0 and dist > 0:
+                score += (BFS_MAX_DEPTH - dist) * 5
 
             if sp.biomass == 2 and tb == 0 and _approx_step_cost(pt) == 1:
                 score -= 250
@@ -567,7 +647,8 @@ class Bot:
 
             return score
 
-        def limited_bfs_first_step(sp: Spore, is_defender: bool, defend_center: Optional[Point]) -> Optional[Position]:
+        def limited_bfs_first_step(sp: Spore, is_defender: bool, is_hunter: bool, 
+                                   defend_center: Optional[Point]) -> Optional[Position]:
             start = _pos_to_point(sp.position)
             q: Deque[Tuple[Point, int, Optional[Position], int]] = deque()
             q.append((start, 0, None, 0))
@@ -586,7 +667,7 @@ class Bot:
                     break
 
                 if depth > 0 and first_dir is not None:
-                    s = _score_tile_for_spore(sp, pt, depth, path_cost, is_defender, defend_center)
+                    s = _score_tile_for_spore(sp, pt, depth, path_cost, is_defender, is_hunter, defend_center)
                     if s > best_score:
                         best_score = s
                         best_dir = first_dir
@@ -617,7 +698,7 @@ class Bot:
             return best_dir
 
         # ---------------------------------------------------------
-        # 10) Move / Fight (time-safe)
+        # Move / Fight
         # ---------------------------------------------------------
         defend_center: Optional[Point] = spawner_pts[0] if spawner_pts else None
         actionable_sorted = sorted(actionable_spores, key=lambda s: s.biomass, reverse=True)
@@ -630,6 +711,7 @@ class Bot:
                 continue
 
             is_defender = sp.id in defender_ids
+            is_hunter = sp.id in hunter_ids
 
             if is_defender and defend_center is not None:
                 if _manhattan(_pos_to_point(sp.position), defend_center) <= 2:
@@ -639,12 +721,10 @@ class Bot:
 
             best_dir: Optional[Position] = None
 
-            # Only do BFS if we have enough time left
             if bfs_used < BFS_SPORE_LIMIT and time_left() > 0.020:
-                best_dir = limited_bfs_first_step(sp, is_defender=is_defender, defend_center=defend_center)
+                best_dir = limited_bfs_first_step(sp, is_defender=is_defender, is_hunter=is_hunter, defend_center=defend_center)
                 bfs_used += 1
 
-            # fallback: 1-step scoring (cheap)
             if best_dir is None:
                 pt = _pos_to_point(sp.position)
                 best_score = -10**18
@@ -665,14 +745,18 @@ class Bot:
                     move_cost = 0 if (tile_owner(npt) == my_team_id and tile_biomass(npt) >= 1) else 1
 
                     score = 0
-                    if is_defender and defend_center is not None:
+                    if is_hunter:
+                        if enemy_here > 0:
+                            score += 450 + (sp.biomass - enemy_here) * 5
+                        score += tile_value(npt)
+                    elif is_defender and defend_center is not None:
                         score -= _manhattan(npt, defend_center) * 35
                         score += (30 if tile_owner(npt) == my_team_id else 0)
                         score += tile_value(npt) // 2
                     else:
-                        score += tile_value(npt) * 2
+                        score += tile_value(npt) * 3
                         if tile_owner(npt) != my_team_id:
-                            score += 60
+                            score += 70
 
                     if move_cost == 0:
                         score += 15
@@ -696,7 +780,6 @@ class Bot:
             if best_dir is not None:
                 add_action_for_spore(sp.id, SporeMoveAction(sporeId=sp.id, direction=best_dir))
             else:
-                # ultimate fallback: cheap MoveTo to a cached high-nutrient tile
                 if is_defender and defend_center is not None:
                     add_action_for_spore(
                         sp.id,
@@ -725,9 +808,5 @@ class Bot:
                             sp.id,
                             SporeMoveToAction(sporeId=sp.id, position=Position(x=best_t.x, y=best_t.y)),
                         )
-
-        # Optional: quick timing log to verify we're below budget
-        # elapsed_ms = (time.perf_counter() - tick_start) * 1000
-        # print(f"[tick] actions={len(actions)} elapsed_ms={elapsed_ms:.1f}")
 
         return actions
