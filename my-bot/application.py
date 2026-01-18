@@ -49,7 +49,7 @@ async def game_loop(websocket: ClientConnection, bot: Bot):
             )
 
         print(f"Playing tick {game_message.tick}")
-
+       
         actions = []
 
         # Just so your bot doesn't completely crash. ;)
